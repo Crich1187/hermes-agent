@@ -167,16 +167,9 @@ def _resolve_browser_feature_state(
     if browser_provider_explicit:
         current_provider = browser_provider or "local"
         if current_provider == "browserbase":
-            provider_available = managed_browser_available or direct_browserbase
-            available = bool(browser_local_available and provider_available)
-            managed = bool(
-                browser_tool_enabled
-                and browser_local_available
-                and managed_browser_available
-                and not direct_browserbase
-            )
+            available = bool(browser_local_available and direct_browserbase)
             active = bool(browser_tool_enabled and available)
-            return current_provider, available, active, managed
+            return current_provider, available, active, False
         if current_provider == "browser-use":
             provider_available = managed_browser_available or direct_browser_use
             available = bool(browser_local_available and provider_available)
