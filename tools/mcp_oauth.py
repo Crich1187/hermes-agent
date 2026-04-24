@@ -513,9 +513,14 @@ def _maybe_preregister_client(
 
 
 def _parse_base_url(server_url: str) -> str:
-    """Strip path component from server URL, returning the base origin."""
-    parsed = urlparse(server_url)
-    return f"{parsed.scheme}://{parsed.netloc}"
+    """Return the exact MCP endpoint URL for OAuth resource matching.
+
+    Older Hermes code stripped the path down to the origin. That breaks modern
+    MCP OAuth protected-resource validation (RFC 8707 / PRM), because servers
+    like Infisical publish the full MCP endpoint as the protected resource. The
+    SDK expects the concrete MCP URL here, not just the origin.
+    """
+    return server_url
 
 
 def build_oauth_auth(

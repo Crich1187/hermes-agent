@@ -133,9 +133,52 @@ def test_manager_builds_hermes_provider_subclass(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     mgr = MCPOAuthManager()
-    provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+    server_url = "https://example.com/api/v1/mcp/connect"
+    provider = mgr.get_or_build_provider("srv", server_url, None)
 
     assert _HERMES_PROVIDER_CLS is not None
     assert isinstance(provider, _HERMES_PROVIDER_CLS)
     assert provider._hermes_server_name == "srv"
+    assert provider.context.server_url == server_url
+
+
+@pytest.mark.asyncio
+async def test_hermes_provider_forwards_asend_values_to_sdk(tmp_path, monkeypatch):
+    """The wrapper must forward HTTPX asend(response) values to the SDK generator.
+
+    Regression test for a bug where wrapping ``super().async_auth_flow()`` with
+    ``async for`` discarded the response objects HTTPX sends back into the auth
+    generator. The SDK then received ``None`` instead of the 401 response and
+    crashed on ``response.status_code``.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from httpx import Request, Response
+    from mcp.client.auth.oauth2 import OAuthClientProvider
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+
+    seen = []
+
+    async def fake_async_auth_flow(self, request):
+        response = yield request
+        seen.append(response)
+        return
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(OAuthClientProvider, "async_auth_flow", fake_async_auth_flow, raising=True)
+
+    mgr = MCPOAuthManager()
+    provider = mgr.get_or_build_provider("srv", "https://example.com/mcp", None)
+
+    flow = provider.async_auth_flow(Request("GET", "https://example.com/mcp"))
+    outbound = await flow.__anext__()
+    assert isinstance(outbound, Request)
+
+    response = Response(401, request=outbound)
+    with pytest.raises(StopAsyncIteration):
+        await flow.asend(response)
+
+    assert seen == [response]
 

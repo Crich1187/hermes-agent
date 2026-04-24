@@ -338,6 +338,10 @@ def show_status(args):
             status += f" (home: {home_channel})"
         
         print(f"  {name:<12}  {check_mark(has_token)} {status}")
+
+    if show_all:
+        print("  Note:         This section shows config/env visible to the current shell.")
+        print("                For live Slack/Telegram/WhatsApp runtime health, run: hermes gateway status")
     
     # =========================================================================
     # Gateway Status

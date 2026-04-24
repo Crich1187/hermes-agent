@@ -491,11 +491,11 @@ def test_configure_callback_port_uses_explicit_port():
     assert cfg["_resolved_port"] == 54321
 
 
-def test_parse_base_url_strips_path():
-    """_parse_base_url drops path components for OAuth discovery."""
+def test_parse_base_url_preserves_full_mcp_endpoint():
+    """_parse_base_url keeps the full MCP URL for protected-resource matching."""
     from tools.mcp_oauth import _parse_base_url
 
-    assert _parse_base_url("https://example.com/mcp/v1") == "https://example.com"
+    assert _parse_base_url("https://example.com/mcp/v1") == "https://example.com/mcp/v1"
     assert _parse_base_url("https://example.com") == "https://example.com"
-    assert _parse_base_url("https://host.example.com:8080/api") == "https://host.example.com:8080"
+    assert _parse_base_url("https://host.example.com:8080/api") == "https://host.example.com:8080/api"
 
