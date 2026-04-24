@@ -128,6 +128,11 @@ export function ChatSidebar({ channel }: ChatSidebarProps) {
   // Event subscriber WebSocket — receives the rebroadcast of every
   // dispatcher emit from the PTY child's gateway.  See /api/pub +
   // /api/events in hermes_cli/web_server.py for the broadcast hop.
+  //
+  // Failures (auth/loopback rejection, server too old to expose the
+  // endpoint, transient drops) surface in the same banner as the
+  // JSON-RPC sidecar so the sidebar matches its documented best-effort
+  // UX and the user always has a reconnect affordance.
   useEffect(() => {
     const token = window.__HERMES_SESSION_TOKEN__;
 
@@ -140,6 +145,27 @@ export function ChatSidebar({ channel }: ChatSidebarProps) {
     const ws = new WebSocket(
       `${proto}//${window.location.host}/api/events?${qs.toString()}`,
     );
+
+    let opened = false
+
+    ws.addEventListener("open", () => {
+      opened = true
+    });
+
+    ws.addEventListener("error", () => {
+      setError("events feed disconnected — tool calls may not appear");
+    });
+
+    ws.addEventListener("close", (ev) => {
+      // Only surface unexpected drops — clean cleanup-time closes from
+      // the unmount path don't need a banner.  4401/4403 are auth /
+      // loopback rejections from the server (treated as fatal).
+      if (ev.code === 4401 || ev.code === 4403) {
+        setError(`events feed rejected (${ev.code}) — reload the page`);
+      } else if (opened && ev.code !== 1000 && ev.code !== 1001) {
+        setError("events feed disconnected — tool calls may not appear");
+      }
+    });
 
     ws.addEventListener("message", (ev) => {
       let frame: RpcEnvelope;

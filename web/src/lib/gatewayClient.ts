@@ -122,6 +122,23 @@ export class GatewayClient {
     );
     this.ws = ws;
 
+    // Register message + close BEFORE awaiting open — the server emits
+    // `gateway.ready` immediately after accept, so a listener attached
+    // after the open promise resolves can race past it and drop the
+    // initial skin payload.
+    ws.addEventListener("message", (ev) => {
+      try {
+        this.dispatch(JSON.parse(ev.data));
+      } catch {
+        /* malformed frame — ignore */
+      }
+    });
+
+    ws.addEventListener("close", () => {
+      this.setState("closed");
+      this.rejectAllPending(new Error("WebSocket closed"));
+    });
+
     await new Promise<void>((resolve, reject) => {
       const onOpen = () => {
         ws.removeEventListener("error", onError);
@@ -135,19 +152,6 @@ export class GatewayClient {
       };
       ws.addEventListener("open", onOpen, { once: true });
       ws.addEventListener("error", onError, { once: true });
-    });
-
-    ws.addEventListener("message", (ev) => {
-      try {
-        this.dispatch(JSON.parse(ev.data));
-      } catch {
-        /* malformed frame — ignore */
-      }
-    });
-
-    ws.addEventListener("close", () => {
-      this.setState("closed");
-      this.rejectAllPending(new Error("WebSocket closed"));
     });
   }
 

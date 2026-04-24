@@ -37,13 +37,13 @@ hermes dashboard --no-open
 
 ## Prerequisites
 
-The web dashboard requires FastAPI and Uvicorn. Install them with:
+The web dashboard requires FastAPI and Uvicorn. The Chat tab additionally needs `ptyprocess` to spawn the embedded TUI behind a pseudo-terminal. Install both with:
 
 ```bash
-pip install hermes-agent[web]
+pip install 'hermes-agent[web,pty]'
 ```
 
-If you installed with `pip install hermes-agent[all]`, the web dependencies are already included.
+The `web` extra pulls in FastAPI/Uvicorn; `pty` pulls in `ptyprocess` (POSIX) or `pywinpty` (native Windows — note that the embedded TUI itself still requires WSL). `pip install hermes-agent[all]` includes both extras and is the easiest path if you also want messaging/voice/etc.
 
 When you run `hermes dashboard` without the dependencies, it will tell you what to install. If the frontend hasn't been built yet and `npm` is available, it builds automatically on first launch.
 
@@ -77,7 +77,7 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 **Prerequisites:**
 
 - Node.js (same requirement as `hermes --tui`; the TUI bundle is built on first launch)
-- `ptyprocess` — included when you `pip install hermes-agent[web]`
+- `ptyprocess` — installed by the `pty` extra (`pip install 'hermes-agent[web,pty]'`, or `[all]` covers both)
 - POSIX kernel (Linux, macOS, or WSL). Native Windows Python is not supported — use WSL.
 
 Close the browser tab and the PTY is reaped cleanly on the server. Re-opening spawns a fresh session.
