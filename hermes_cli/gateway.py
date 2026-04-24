@@ -2798,7 +2798,25 @@ def _runtime_health_lines() -> list[str]:
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
 
+    target_platforms = ("telegram", "whatsapp", "slack")
+    show_live_platform_states = gateway_state in {"running", "draining"}
+    for platform in target_platforms:
+        pdata = platforms.get(platform) or {}
+        platform_state = pdata.get("state")
+        if platform_state == "fatal":
+            message = pdata.get("error_message") or "unknown error"
+            lines.append(f"⚠ {platform}: {message}")
+        elif show_live_platform_states and platform_state == "connected":
+            lines.append(f"✓ {platform}: runtime connected")
+        elif show_live_platform_states and platform_state == "retrying":
+            message = pdata.get("error_message") or "retrying"
+            lines.append(f"⚠ {platform}: runtime retrying — {message}")
+        elif show_live_platform_states and platform_state == "disconnected":
+            lines.append(f"⚠ {platform}: runtime disconnected")
+
     for platform, pdata in platforms.items():
+        if platform in target_platforms:
+            continue
         if pdata.get("state") == "fatal":
             message = pdata.get("error_message") or "unknown error"
             lines.append(f"⚠ {platform}: {message}")
