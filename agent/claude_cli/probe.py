@@ -8,12 +8,31 @@ PR 1 ships discovery + version helpers + the integration entry points.
 Subsequent PRs use the probe; v1 adapter init refuses to start if the
 probe fails any assertion.
 
+**Scope of v1 ``run_probe()`` runtime assertions:** ``run_probe()`` invokes
+``_run_basic_invocation_assertion`` only — verifying that the binary
+spawns, stream-json output parses, and stdin prompt transport is
+supported. The remaining contract assertions in the design spec
+(``--resume`` continuity, hermetic-settings precedence, ``--allowedTools
+""`` tool denial, ``--strict-mcp-config`` isolation, process group
+cleanup, ``--no-session-persistence``, model alias acceptance) are
+covered only by the e2e integration tests in
+``tests/e2e/test_claude_cli_probe.py``. PR 4 (adapter wiring) will fold
+these remaining assertions into ``run_probe()`` itself so adapter init
+can fail closed on any of them.
+
 Public surface:
 
   * ``discover_binary(path=None) -> str``
   * ``parse_version_string(s) -> tuple[int, int, int]``
   * ``check_version(version, min_version) -> tuple[int, int, int]``
   * ``check_env_hygiene(env, *, require_token=True) -> dict[str, str]``
+  * ``CacheKeyInputs`` — frozen dataclass of cache-invalidating inputs
+  * ``ProbeResult`` — persistable probe outcome dataclass
+  * ``ProbeConfig`` — input config for ``run_probe``
+  * ``cache_key(inputs) -> str``
+  * ``compute_binary_hash(path) -> str``
+  * ``save_cache(result, path)`` / ``load_cache(path) -> Optional[ProbeResult]``
+  * ``extract_session_id(events) -> Optional[str]``
   * ``run_probe(config) -> ProbeResult``
   * ``__main__`` runs the probe and prints results as JSON.
 """

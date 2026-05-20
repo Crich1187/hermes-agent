@@ -12,6 +12,16 @@ The adapter itself is not yet wired into Hermes' provider runtime; see
 `docs/superpowers/specs/2026-05-16-hermes-claude-code-cli-adapter-design.md`
 for the full plan and v1 scope.
 
+> **Scope caveat for `run_probe()`:** in PR 1, `run_probe()` runs only the
+> basic-invocation assertion (binary spawns, stream-json parses, stdin
+> prompt transport works). The remaining contract assertions documented in
+> Appendix A — `--resume`, hermetic settings precedence, `--allowedTools`
+> denial, `--strict-mcp-config`, process group cleanup,
+> `--no-session-persistence`, model alias acceptance — are covered only by
+> the e2e integration tests in `tests/e2e/test_claude_cli_probe.py`. PR 4
+> (adapter wiring) will fold these into `run_probe()` so adapter init can
+> fail closed on any of them.
+
 Subsequent PRs (not yet landed):
 
 - PR 2: `process.py` — subprocess spawn / drain / kill primitives.
@@ -34,7 +44,7 @@ The probe runs at adapter init in production (results cached for 24h) and as
 a CLI entry point for operators:
 
 ```bash
-cd /root/.hermes/hermes-agent-claude-cli-pr1
+cd /root/.hermes/hermes-agent
 ./venv/bin/python -m agent.claude_cli.probe [--no-cache] [--binary-path /path/to/claude]
 ```
 
@@ -47,7 +57,7 @@ The integration tests against the real `claude` binary are gated by the
 (short prompts, total spend is trivial).
 
 ```bash
-cd /root/.hermes/hermes-agent-claude-cli-pr1
+cd /root/.hermes/hermes-agent
 set -a && source /run/infisical/hermes.env && set +a
 ./venv/bin/python -m pytest tests/e2e/test_claude_cli_probe.py -v -m integration
 ```
