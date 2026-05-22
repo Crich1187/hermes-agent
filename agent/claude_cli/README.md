@@ -7,7 +7,7 @@ that direct-HTTPS callers hit.
 
 ## Status
 
-**PR 1 of 6 — landed.** Probe + protocol parser + CLI contract documentation.
+**PR 1 of 6 — landed. PR 2 of 6 — landed (process layer).** Probe + protocol parser + CLI contract documentation + subprocess lifecycle.
 The adapter itself is not yet wired into Hermes' provider runtime; see
 `docs/superpowers/specs/2026-05-16-hermes-claude-code-cli-adapter-design.md`
 for the full plan and v1 scope.
@@ -24,19 +24,20 @@ for the full plan and v1 scope.
 
 Subsequent PRs (not yet landed):
 
-- PR 2: `process.py` — subprocess spawn / drain / kill primitives.
+- PR 2: `process.py` — subprocess spawn / drain / kill primitives. **Landed.**
 - PR 3: `settings.py`, `mcp_config.py`, `session_store.py`.
 - PR 4: `adapter.py` — the provider adapter, registered as `claude_code_cli`.
 - PR 5: end-to-end wiring; `model.provider: claude-code-subprocess` becomes selectable.
 - PR 6 (optional): cross-provider fallback behavior.
 
-## What ships in PR 1
+## What ships in PR 1 + PR 2
 
 | Module | Purpose |
 |---|---|
 | `errors.py` | Exception hierarchy: `ClaudeCliError` base + 7 subclasses. |
 | `protocol.py` | `StreamJsonParser` — pure NDJSON parser for `claude --print --output-format stream-json` output. No I/O. |
 | `probe.py` | Compatibility probe: binary discovery, version check, env hygiene, cache, `_run_basic_invocation_assertion`, `extract_session_id`, `run_probe`, CLI entry point. |
+| `process.py` | `ClaudeProcess` + `CancelToken` + `spawn()`: subprocess lifecycle with concurrent stdout/stderr drain, `start_new_session=True` pgroup isolation, SIGTERM→grace→SIGKILL cancellation, and context-managed cleanup. |
 
 ## Running the probe
 
@@ -70,6 +71,30 @@ See Appendix A of the design spec at
 `/root/docs/superpowers/specs/2026-05-16-hermes-claude-code-cli-adapter-design.md`
 for the empirically-verified CLI contract (prompt transport, session_id schema,
 flag behavior, model alias mapping, hermetic-config posture).
+
+## PR 2 usage example
+
+```python
+from agent.claude_cli import spawn, CancelToken
+
+token = CancelToken()
+proc = await spawn(
+    argv=["claude", "-p", "--output-format", "stream-json", "--verbose"],
+    env=sanitized_env,
+    cancel_token=token,
+    cancel_grace_seconds=5.0,
+)
+async with proc:
+    proc._proc.stdin.write(b"hello\n")
+    proc._proc.stdin.close()
+    async for event in proc.events():
+        handle(event)
+    await proc.wait_until_exit()
+
+# Cleanup is automatic on __aexit__: stdin closed, reader tasks awaited,
+# process group reaped. Calling token.cancel() from another task triggers
+# SIGTERM → 5s grace → SIGKILL.
+```
 
 ## Test coverage
 
