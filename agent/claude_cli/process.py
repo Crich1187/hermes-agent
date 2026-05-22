@@ -87,6 +87,7 @@ class ClaudeProcess:
         self._parser = StreamJsonParser()
         self._event_queue: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue()
         self._tasks_started = False
+        self._aexit_done = False
 
     @property
     def pid(self) -> int:
@@ -103,6 +104,45 @@ class ClaudeProcess:
     async def wait_until_exit(self) -> int:
         """Block until the child exits. Returns the exit code."""
         return await self._proc.wait()
+
+    async def __aenter__(self) -> "ClaudeProcess":
+        self._start_tasks()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        # Idempotency: if we've already cleaned up, return immediately.
+        if self._aexit_done:
+            return
+        try:
+            # If the body raised or the caller cancelled, ensure the child
+            # process is terminated. Otherwise we still drain to completion.
+            if self._proc.returncode is None:
+                self._cancel_token.cancel()
+            # Wait for reader tasks and the process to finish.
+            tasks: list[asyncio.Task[Any]] = []
+            for t in (self._stdout_task, self._stderr_task, self._wait_task):
+                if t is not None:
+                    tasks.append(t)
+            if tasks:
+                # gather with return_exceptions so a parser failure in stdout
+                # task does not block stderr/wait cleanup.
+                await asyncio.gather(*tasks, return_exceptions=True)
+            # Cancel the cancel_watcher if it's still waiting (process exited
+            # normally and the token was never cancelled).
+            if self._cancel_watcher is not None and not self._cancel_watcher.done():
+                self._cancel_token.cancel()
+                try:
+                    await asyncio.wait_for(self._cancel_watcher, timeout=1.0)
+                except asyncio.TimeoutError:
+                    self._cancel_watcher.cancel()
+            # Close stdin if it's still open.
+            if self._proc.stdin is not None and not self._proc.stdin.is_closing():
+                try:
+                    self._proc.stdin.close()
+                except Exception:  # noqa: BLE001 — best-effort close
+                    pass
+        finally:
+            self._aexit_done = True
 
     def _start_tasks(self) -> None:
         """Idempotently start stdout/stderr reader + wait tasks."""

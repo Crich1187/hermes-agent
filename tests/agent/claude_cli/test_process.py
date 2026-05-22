@@ -147,3 +147,62 @@ class TestEventsAndStderr:
             events.append(ev)
         await proc.wait_until_exit()
         assert any(e["type"] == "result" for e in events)
+
+
+class TestAsyncContextManager:
+    @pytest.mark.asyncio
+    async def test_aenter_returns_self(self):
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "exit 0"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        async with proc as p:
+            assert p is proc
+        assert proc.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_aexit_drains_and_reaps_on_normal_completion(self):
+        script = (
+            'printf \'{"type":"assistant","data":"hi"}\\n\'; '
+            'printf \'{"type":"result"}\\n\''
+        )
+        proc = await spawn(
+            argv=["/bin/sh", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        events = []
+        async with proc as p:
+            async for ev in p.events():
+                events.append(ev)
+        # After __aexit__, the process MUST be reaped.
+        assert proc.exit_code == 0
+        assert any(e["type"] == "result" for e in events)
+
+    @pytest.mark.asyncio
+    @pytest.mark.xfail(reason="kill_process_group not yet implemented (Task 5)")
+    async def test_aexit_cleans_up_on_exception_in_body(self):
+        # User raises inside the context — ClaudeProcess still cleans up.
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "sleep 5; exit 0"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        with pytest.raises(ValueError, match="caller bug"):
+            async with proc:
+                raise ValueError("caller bug")
+        # Cleanup must have terminated the child.
+        assert proc.exit_code is not None
+        # Reader tasks must have ended (no leaked tasks holding pipes open).
+        assert proc._stdout_task is None or proc._stdout_task.done()
+        assert proc._stderr_task is None or proc._stderr_task.done()
+
+    @pytest.mark.asyncio
+    async def test_aexit_is_idempotent(self):
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "exit 0"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        async with proc:
+            pass
+        # Calling __aexit__ again must not raise.
+        await proc.__aexit__(None, None, None)
+        assert proc.exit_code == 0
