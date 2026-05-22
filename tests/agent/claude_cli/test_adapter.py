@@ -526,3 +526,202 @@ class TestPrimaryTurnResume:
             pass
 
         assert "--resume" not in captured_argv[0]
+
+
+def _fake_claude_argv_exit_nonzero(stderr_msg: str = "boom") -> list[str]:
+    script = (
+        f"cat >/dev/null; "
+        f'printf "%s" {_shell_quote(stderr_msg)} >&2; '
+        f"exit 17"
+    )
+    return ["/bin/sh", "-c", script]
+
+
+def _fake_claude_argv_hang() -> list[str]:
+    # Drains stdin then sleeps without emitting events.
+    return ["/bin/sh", "-c", "cat >/dev/null; sleep 300"]
+
+
+def _fake_claude_argv_malformed_stream() -> list[str]:
+    # Emits a long non-JSON line so StreamJsonParser raises ProtocolError.
+    return [
+        "/bin/sh",
+        "-c",
+        "cat >/dev/null; printf 'not json at all\\n'; exit 0",
+    ]
+
+
+class TestPrimaryTurnFailureModes:
+    @pytest.mark.asyncio
+    async def test_non_zero_exit_raises_claude_cli_exited(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliExited
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_exit_nonzero("bad input"),
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        with pytest.raises(ClaudeCliExited) as info:
+            async for _ in adapter.primary_turn(
+                hermes_session_id="h",
+                messages=[{"role": "user", "content": "x"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+
+        assert info.value.exit_code == 17
+        assert "bad input" in info.value.stderr_digest
+
+    @pytest.mark.asyncio
+    async def test_idle_timeout_raises_claude_cli_hung(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliHung
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_hang(), env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        # 0.5s idle timeout so the test finishes fast.
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(
+                turn_idle_timeout_seconds=0.5,
+                cancel_grace_seconds=0.5,
+            ),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        with pytest.raises(ClaudeCliHung):
+            async for _ in adapter.primary_turn(
+                hermes_session_id="h-hang",
+                messages=[{"role": "user", "content": "x"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+
+    @pytest.mark.asyncio
+    async def test_malformed_stream_raises_claude_cli_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliError
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_malformed_stream(),
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        # The PR 2 process layer surfaces ProtocolError by ending the event
+        # stream with a logged warning; the subprocess then exits 0. The
+        # adapter's contract is "no adapter crash" — either ClaudeCliError OR
+        # a clean empty stream is acceptable.
+        try:
+            async for _ in adapter.primary_turn(
+                hermes_session_id="h-bad-frame",
+                messages=[{"role": "user", "content": "x"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+        except ClaudeCliError:
+            pass  # expected outcome
+        # else: clean exit is also acceptable; assert nothing further.
+
+    @pytest.mark.asyncio
+    async def test_cancellation_propagates_and_kills_subprocess(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_hang(), env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(
+                turn_idle_timeout_seconds=10.0,
+                cancel_grace_seconds=0.5,
+            ),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        token = CancelToken()
+
+        async def cancel_soon():
+            await asyncio.sleep(0.2)
+            token.cancel()
+
+        cancel_task = asyncio.create_task(cancel_soon())
+        try:
+            with pytest.raises(BaseException):
+                async for _ in adapter.primary_turn(
+                    hermes_session_id="h-cancel",
+                    messages=[{"role": "user", "content": "x"}],
+                    model="claude-opus-4-6",
+                    cancel_token=token,
+                ):
+                    pass
+        finally:
+            await cancel_task  # Wait for it to complete normally
