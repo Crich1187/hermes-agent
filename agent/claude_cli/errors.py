@@ -54,3 +54,8 @@ class PromptTooLarge(ClaudeCliError):
     supported and a bounded-argv fallback mode is used. Default v1 path
     uses stdin (no bound).
     """
+
+
+class SubprocessSpawnFailed(ClaudeCliError):
+    """`asyncio.create_subprocess_exec` raised OSError (binary missing,
+    permission denied, fork failure). The process never reached running state."""

@@ -20,14 +20,18 @@ from agent.claude_cli.errors import (
     ProtocolError,
     PromptTooLarge,
 )
+from agent.claude_cli.process import CancelToken, ClaudeProcess, spawn
 
 __all__ = [
+    "CancelToken",
     "ClaudeCliAuthMissing",
     "ClaudeCliError",
     "ClaudeCliIncompatible",
     "ClaudeCliUnavailable",
     "ClaudeCliVersionTooOld",
+    "ClaudeProcess",
     "HermesDirectAnthropicEgressDetected",
     "ProtocolError",
     "PromptTooLarge",
+    "spawn",
 ]
