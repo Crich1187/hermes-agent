@@ -227,8 +227,47 @@ class ClaudeProcess:
         return prefix + tail.decode("utf-8", errors="replace")
 
     async def _kill_process_group(self) -> None:
-        """Stub — filled in by Task 5 (cancellation)."""
-        return
+        """SIGTERM the pgid; after ``cancel_grace_seconds``, SIGKILL it.
+
+        Idempotent: subsequent calls return immediately without re-signalling.
+        """
+        if self._cancelled_kill_done:
+            return
+        self._cancelled_kill_done = True
+        pgid = self._pgid
+        # SIGTERM first.
+        try:
+            os.killpg(pgid, signal.SIGTERM)
+            logger.debug("sent SIGTERM to pgid %d", pgid)
+        except ProcessLookupError:
+            return  # already dead
+        except PermissionError as exc:
+            logger.warning("killpg(SIGTERM) denied for pgid %d: %s", pgid, exc)
+        # Wait up to cancel_grace_seconds for graceful exit.
+        try:
+            await asyncio.wait_for(
+                self._proc.wait(),
+                timeout=self._cancel_grace_seconds,
+            )
+            return
+        except asyncio.TimeoutError:
+            logger.info(
+                "child pgid %d did not exit within %.1fs of SIGTERM; escalating to SIGKILL",
+                pgid,
+                self._cancel_grace_seconds,
+            )
+        # Escalate.
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+        except PermissionError as exc:
+            logger.error("killpg(SIGKILL) denied for pgid %d: %s", pgid, exc)
+        # Best-effort final wait so reader tasks unblock.
+        try:
+            await asyncio.wait_for(self._proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error("child pgid %d still alive after SIGKILL", pgid)
 
 
 async def spawn(

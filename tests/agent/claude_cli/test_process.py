@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import signal
 import sys
 
 import pytest
@@ -179,7 +180,6 @@ class TestAsyncContextManager:
         assert any(e["type"] == "result" for e in events)
 
     @pytest.mark.asyncio
-    @pytest.mark.xfail(reason="kill_process_group not yet implemented (Task 5)")
     async def test_aexit_cleans_up_on_exception_in_body(self):
         # User raises inside the context — ClaudeProcess still cleans up.
         proc = await spawn(
@@ -206,3 +206,94 @@ class TestAsyncContextManager:
         # Calling __aexit__ again must not raise.
         await proc.__aexit__(None, None, None)
         assert proc.exit_code == 0
+
+
+class TestCancellation:
+    @pytest.mark.asyncio
+    async def test_cancel_sigterm_kills_cooperative_child(self):
+        # Default sh handles SIGTERM by exiting; cancel ends it fast.
+        token = CancelToken()
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "sleep 30"],
+            env={"PATH": "/usr/bin:/bin"},
+            cancel_token=token,
+            cancel_grace_seconds=2.0,
+        )
+        async with proc:
+            await asyncio.sleep(0.05)
+            token.cancel()
+            await proc.wait_until_exit()
+        # SIGTERM exit: returncode is negative SIGTERM (-15) on POSIX.
+        assert proc.exit_code is not None
+        assert proc.exit_code != 0
+
+    @pytest.mark.asyncio
+    async def test_cancel_sigkill_escalation_for_stubborn_child(self):
+        # Bash that traps SIGTERM and refuses to die.
+        # The grace is set very short so the test runs in < 2s.
+        token = CancelToken()
+        script = (
+            "trap '' TERM; "  # ignore SIGTERM
+            "while :; do sleep 0.1; done"
+        )
+        proc = await spawn(
+            argv=["/bin/bash", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+            cancel_token=token,
+            cancel_grace_seconds=0.5,
+        )
+        start = asyncio.get_event_loop().time()
+        async with proc:
+            await asyncio.sleep(0.1)
+            token.cancel()
+            await proc.wait_until_exit()
+        elapsed = asyncio.get_event_loop().time() - start
+        # Must have escalated to SIGKILL within (grace + a margin).
+        assert elapsed < 3.0
+        # SIGKILL: returncode == -9 on POSIX.
+        assert proc.exit_code == -signal.SIGKILL
+
+    @pytest.mark.asyncio
+    async def test_multiple_cancels_are_idempotent(self):
+        token = CancelToken()
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "sleep 30"],
+            env={"PATH": "/usr/bin:/bin"},
+            cancel_token=token,
+            cancel_grace_seconds=1.0,
+        )
+        async with proc:
+            token.cancel()
+            token.cancel()
+            token.cancel()
+            await proc.wait_until_exit()
+        # Process exited, no exceptions raised by repeated cancels.
+        assert proc.exit_code is not None
+
+    @pytest.mark.asyncio
+    async def test_kill_process_group_reaps_grandchildren(self):
+        # Spawn a bash that spawns a sub-bash holding a pipe. killpg must
+        # reap both. We assert by PID-search after the parent exits.
+        token = CancelToken()
+        script = "(sleep 30) & echo $! ; wait"
+        proc = await spawn(
+            argv=["/bin/bash", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+            cancel_token=token,
+            cancel_grace_seconds=0.5,
+        )
+        async with proc:
+            async for _ in proc.events():
+                # First (non-JSON) stdout line is the grandchild pid. Parser
+                # tolerates a few non-JSON lines. We break early.
+                break
+            await asyncio.sleep(0.1)
+            token.cancel()
+            await proc.wait_until_exit()
+        # The grandchild is in the same pgid; killpg(pgid, SIGKILL) reaped it.
+        try:
+            os.killpg(proc.pgid, 0)
+            still_alive = True
+        except (ProcessLookupError, PermissionError):
+            still_alive = False
+        assert not still_alive
