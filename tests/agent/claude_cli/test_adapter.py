@@ -725,3 +725,210 @@ class TestPrimaryTurnFailureModes:
                     pass
         finally:
             await cancel_task  # Wait for it to complete normally
+
+
+class TestPrimaryTurnConcurrency:
+    @pytest.mark.asyncio
+    async def test_per_session_lock_queues_second_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # With policy=queue (default), two concurrent turns on the same
+        # hermes session run sequentially.
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+        timeline: list[str] = []
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            timeline.append("spawn")
+            return await real_spawn(
+                _fake_claude_argv_one_event(session_id="claude-x"),
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        async def one_turn(label: str) -> None:
+            async for _ in adapter.primary_turn(
+                hermes_session_id="hermes-shared",
+                messages=[{"role": "user", "content": label}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+            timeline.append(f"done:{label}")
+
+        await asyncio.gather(one_turn("a"), one_turn("b"))
+
+        assert timeline.count("spawn") == 2
+        first_done_idx = next(
+            i for i, x in enumerate(timeline) if x.startswith("done:")
+        )
+        second_spawn_idx = [i for i, x in enumerate(timeline) if x == "spawn"][1]
+        assert first_done_idx < second_spawn_idx
+
+    @pytest.mark.asyncio
+    async def test_session_busy_reject_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import SessionBusyError
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                ["/bin/sh", "-c", "cat >/dev/null; sleep 0.3; "
+                 + "printf '%s\\n' "
+                 + _shell_quote('{"type":"system","session_id":"s"}')
+                 + " && "
+                 + "printf '%s\\n' "
+                 + _shell_quote(
+                     '{"type":"assistant","message":{"role":"assistant",'
+                     '"content":[{"type":"text","text":"hi"}]},"session_id":"s"}'
+                 )
+                 + " && "
+                 + "printf '%s\\n' "
+                 + _shell_quote('{"type":"result","session_id":"s"}')],
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(session_busy_policy="reject"),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        async def slow_first() -> None:
+            async for _ in adapter.primary_turn(
+                hermes_session_id="hermes-busy",
+                messages=[{"role": "user", "content": "first"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+
+        first_task = asyncio.create_task(slow_first())
+        await asyncio.sleep(0.05)  # let first acquire the lock
+
+        with pytest.raises(SessionBusyError):
+            async for _ in adapter.primary_turn(
+                hermes_session_id="hermes-busy",
+                messages=[{"role": "user", "content": "second"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+
+        await first_task
+
+    @pytest.mark.asyncio
+    async def test_primary_semaphore_bounds_concurrent_turns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        inflight = 0
+        peak = 0
+        lock = asyncio.Lock()
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            nonlocal inflight, peak
+            async with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                return await real_spawn(
+                    ["/bin/sh", "-c",
+                     "cat >/dev/null; sleep 0.2; "
+                     "printf '%s\\n' "
+                     + _shell_quote('{"type":"system","session_id":"s"}')
+                     + " && printf '%s\\n' "
+                     + _shell_quote(
+                         '{"type":"assistant","message":{"role":"assistant",'
+                         '"content":[{"type":"text","text":"hi"}]},"session_id":"s"}'
+                     )
+                     + " && printf '%s\\n' "
+                     + _shell_quote('{"type":"result","session_id":"s"}')],
+                    env=env, cwd=cwd, **kw,
+                )
+            finally:
+                async with lock:
+                    inflight -= 1
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(primary_concurrency=2),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        async def one_turn(label: str) -> None:
+            async for _ in adapter.primary_turn(
+                hermes_session_id=f"hermes-{label}",
+                messages=[{"role": "user", "content": label}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
+
+        # Fire 5 turns across 5 distinct hermes sessions; peak in-flight
+        # subprocesses must never exceed primary_concurrency=2.
+        await asyncio.gather(*[one_turn(str(i)) for i in range(5)])
+        assert peak <= 2
+
+    @pytest.mark.asyncio
+    async def test_primary_turn_after_close_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliError
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+        await adapter.close()
+
+        with pytest.raises(ClaudeCliError):
+            async for _ in adapter.primary_turn(
+                hermes_session_id="h",
+                messages=[{"role": "user", "content": "x"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                pass
