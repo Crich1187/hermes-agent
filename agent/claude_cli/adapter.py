@@ -388,3 +388,100 @@ class ClaudeCliAdapter:
                     captured_id = sid
 
             yield event
+
+    def _build_aux_argv(
+        self,
+        *,
+        settings_path: Path,
+        mcp_path: Path,
+        model: str,
+    ) -> list[str]:
+        return [
+            self.config.binary,
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--no-session-persistence",
+            "--settings", str(settings_path),
+            "--mcp-config", str(mcp_path),
+            "--strict-mcp-config",
+            "--allowedTools", ",".join(self.config.allowed_tools),
+            "--model", model,
+        ]
+
+    async def aux_call(
+        self,
+        prompt: str,
+        *,
+        model: str,
+        deadline: float,
+    ) -> str:
+        if self._closed:
+            raise errors.ClaudeCliError("adapter is closed")
+        if not self._inited:
+            raise errors.ClaudeCliError("adapter.init() has not been called")
+
+        async with self._aux_sem:
+            try:
+                return await asyncio.wait_for(
+                    self._run_aux_call(prompt, model=model),
+                    timeout=deadline,
+                )
+            except asyncio.TimeoutError as exc:
+                raise errors.ClaudeCliAuxTimeout(
+                    f"aux call exceeded deadline of {deadline:.1f}s"
+                ) from exc
+
+    async def _run_aux_call(self, prompt: str, *, model: str) -> str:
+        settings_dir = self._ensure_settings_dir()
+        settings_path = write_settings_file(
+            generate_settings(
+                workspace_dir=self._resolved_workspace_dir(),
+                allowed_tools=self.config.allowed_tools,
+                disallowed_tools=self.config.disallowed_tools,
+            ),
+            parent_dir=settings_dir,
+        )
+        mcp_path = write_mcp_config_file(
+            generate_mcp_config(self.config.mcp_servers_allowlist),
+            parent_dir=settings_dir,
+        )
+        argv = self._build_aux_argv(
+            settings_path=settings_path, mcp_path=mcp_path, model=model,
+        )
+        cancel_token = CancelToken()
+        proc = await spawn(
+            argv=argv,
+            env=self._spawn_env,
+            cwd=self.config.workspace_dir or None,
+            cancel_token=cancel_token,
+            cancel_grace_seconds=self.config.cancel_grace_seconds,
+        )
+
+        assistant_text_parts: list[str] = []
+        async with proc:
+            assert proc._proc.stdin is not None
+            try:
+                proc._proc.stdin.write(prompt.encode("utf-8"))
+                await proc._proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                pass
+            finally:
+                if not proc._proc.stdin.is_closing():
+                    proc._proc.stdin.close()
+
+            async for event in proc.events():
+                if event.get("type") == "assistant":
+                    msg = event.get("message", {})
+                    for block in msg.get("content", []) or []:
+                        if isinstance(block, dict) and block.get("type") == "text":
+                            text = block.get("text")
+                            if isinstance(text, str):
+                                assistant_text_parts.append(text)
+
+        if proc.exit_code != 0:
+            raise errors.ClaudeCliExited(
+                exit_code=proc.exit_code if proc.exit_code is not None else -1,
+                stderr_digest=proc.stderr_digest,
+            )
+        return "".join(assistant_text_parts)

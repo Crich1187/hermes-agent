@@ -932,3 +932,146 @@ class TestPrimaryTurnConcurrency:
                 cancel_token=CancelToken(),
             ):
                 pass
+
+
+def _fake_claude_argv_aux(text: str) -> list[str]:
+    payload = (
+        '{"type":"system","session_id":"aux"}\n'
+        f'{{"type":"assistant","message":{{"role":"assistant",'
+        f'"content":[{{"type":"text","text":"{text}"}}]}},'
+        f'"session_id":"aux"}}\n'
+        '{"type":"result","session_id":"aux"}\n'
+    )
+    script = f"cat >/dev/null; printf '%s' {_shell_quote(payload)}"
+    return ["/bin/sh", "-c", script]
+
+
+class TestAuxCall:
+    @pytest.mark.asyncio
+    async def test_aux_call_returns_concatenated_assistant_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+        captured_argv: list[list[str]] = []
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            captured_argv.append(list(argv))
+            return await real_spawn(
+                _fake_claude_argv_aux("compressed summary"),
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        result = await adapter.aux_call(
+            "summarise this conversation",
+            model="claude-haiku",
+            deadline=10.0,
+        )
+        assert "compressed summary" in result
+
+        argv = captured_argv[0]
+        # Aux argv MUST include --no-session-persistence and MUST NOT have --resume.
+        assert "--no-session-persistence" in argv
+        assert "--resume" not in argv
+
+    @pytest.mark.asyncio
+    async def test_aux_call_honors_deadline_and_raises_timeout(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliAuxTimeout
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_hang(), env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(cancel_grace_seconds=0.5),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        with pytest.raises(ClaudeCliAuxTimeout):
+            await adapter.aux_call(
+                "long prompt",
+                model="claude-haiku",
+                deadline=0.5,
+            )
+
+    @pytest.mark.asyncio
+    async def test_aux_semaphore_bounds_concurrent_aux_calls(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        inflight = 0
+        peak = 0
+        lock = asyncio.Lock()
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            nonlocal inflight, peak
+            async with lock:
+                inflight += 1
+                peak = max(peak, inflight)
+            try:
+                return await real_spawn(
+                    ["/bin/sh", "-c",
+                     "cat >/dev/null; sleep 0.2; "
+                     "printf '%s\\n' "
+                     + _shell_quote('{"type":"system","session_id":"a"}')
+                     + " && printf '%s\\n' "
+                     + _shell_quote(
+                         '{"type":"assistant","message":{"role":"assistant",'
+                         '"content":[{"type":"text","text":"x"}]},"session_id":"a"}'
+                     )
+                     + " && printf '%s\\n' "
+                     + _shell_quote('{"type":"result","session_id":"a"}')],
+                    env=env, cwd=cwd, **kw,
+                )
+            finally:
+                async with lock:
+                    inflight -= 1
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(aux_concurrency=1),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        await asyncio.gather(
+            adapter.aux_call("a", model="m", deadline=10.0),
+            adapter.aux_call("b", model="m", deadline=10.0),
+            adapter.aux_call("c", model="m", deadline=10.0),
+        )
+        assert peak == 1
