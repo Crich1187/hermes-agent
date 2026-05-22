@@ -295,3 +295,135 @@ class TestAdapterInit:
         )
         with pytest.raises(ClaudeCliError):
             await adapter.init()
+
+
+def _shell_quote(s: str) -> str:
+    """Single-quote a string safely for /bin/sh -c."""
+    return "'" + s.replace("'", "'\\''") + "'"
+
+
+def _fake_claude_argv_one_event(session_id: str, content: str = "hello") -> list[str]:
+    """Build a /bin/sh argv that emits one canned stream-json conversation."""
+    payload = (
+        f'{{"type":"system","subtype":"init","session_id":"{session_id}"}}'
+        f"\n"
+        f'{{"type":"assistant","message":{{"role":"assistant",'
+        f'"content":[{{"type":"text","text":"{content}"}}]}},'
+        f'"session_id":"{session_id}"}}'
+        f"\n"
+        f'{{"type":"result","subtype":"success","session_id":"{session_id}"}}'
+        f"\n"
+    )
+    # Drain stdin (so adapter's writer succeeds) then emit JSON, then exit.
+    script = f"cat >/dev/null; printf '%s' {_shell_quote(payload)}"
+    return ["/bin/sh", "-c", script]
+
+
+class TestPrimaryTurnHappyPath:
+    @pytest.mark.asyncio
+    async def test_first_turn_streams_events_and_sets_session_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        # Override the binary at argv-build time.
+        captured_argv: list[list[str]] = []
+        real_spawn = adapter_mod.spawn
+
+        async def intercepting_spawn(argv, env, cwd=None, **kw):
+            captured_argv.append(list(argv))
+            new_argv = _fake_claude_argv_one_event(
+                session_id="claude-session-abc"
+            )
+            return await real_spawn(new_argv, env=env, cwd=cwd, **kw)
+
+        monkeypatch.setattr(adapter_mod, "spawn", intercepting_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        events: list[dict] = []
+        token = CancelToken()
+        async for event in adapter.primary_turn(
+            hermes_session_id="hermes-1",
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-opus-4-6",
+            cancel_token=token,
+        ):
+            events.append(event)
+
+        # Stream included system + assistant + result.
+        event_types = [e.get("type") for e in events]
+        assert "system" in event_types
+        assert "assistant" in event_types
+        assert "result" in event_types
+
+        # Session was learned and stored.
+        stored, is_new = adapter._sessions.get_or_create("hermes-1")
+        assert stored == "claude-session-abc"
+        assert is_new is False
+
+        # First-turn argv had --settings, --mcp-config, --strict-mcp-config,
+        # --output-format stream-json, --verbose, --model — but NOT --resume.
+        assert len(captured_argv) == 1
+        argv = captured_argv[0]
+        assert "--output-format" in argv and "stream-json" in argv
+        assert "--verbose" in argv
+        assert "--settings" in argv
+        assert "--mcp-config" in argv
+        assert "--strict-mcp-config" in argv
+        assert "--model" in argv
+        assert "claude-opus-4-6" in argv
+        assert "--resume" not in argv
+
+    @pytest.mark.asyncio
+    async def test_first_turn_emits_telemetry(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_one_event(session_id="claude-xyz"),
+                env=env,
+                cwd=cwd,
+                **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        caplog.set_level("INFO")
+        async for _ in adapter.primary_turn(
+            hermes_session_id="hermes-tele",
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            pass
+
+        messages = [r.getMessage() for r in caplog.records]
+        assert any("claude_cli.turn.start" in m for m in messages)
+        assert any("claude_cli.turn.end" in m for m in messages)

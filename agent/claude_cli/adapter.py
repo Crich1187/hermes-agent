@@ -163,3 +163,228 @@ class ClaudeCliAdapter:
 
         self._spawn_env = sanitized
         self._inited = True
+
+    # ---- helpers ----
+
+    async def _get_session_lock(self, hermes_session_id: str) -> asyncio.Lock:
+        async with self._session_locks_guard:
+            lock = self._session_locks.get(hermes_session_id)
+            if lock is None:
+                lock = asyncio.Lock()
+                self._session_locks[hermes_session_id] = lock
+            return lock
+
+    def _ensure_settings_dir(self) -> Path:
+        if self._session_settings_dir is None:
+            self._session_settings_dir = make_session_settings_dir()
+        return self._session_settings_dir
+
+    def _resolved_workspace_dir(self) -> str:
+        return self.config.workspace_dir or str(self._ensure_settings_dir())
+
+    def _build_primary_argv(
+        self,
+        *,
+        settings_path: Path,
+        mcp_path: Path,
+        model: str,
+        claude_session_id: Optional[str],
+    ) -> list[str]:
+        argv = [
+            self.config.binary,
+            "-p",
+            "--output-format", "stream-json",
+            "--verbose",
+            "--settings", str(settings_path),
+            "--mcp-config", str(mcp_path),
+            "--strict-mcp-config",
+            "--allowedTools", ",".join(self.config.allowed_tools),
+            "--model", model,
+        ]
+        if claude_session_id is not None:
+            argv.extend(["--resume", claude_session_id])
+        return argv
+
+    @staticmethod
+    def _format_prompt(messages: list[Message], is_new: bool) -> str:
+        """Serialise messages to the prompt fed via stdin."""
+        if not messages:
+            return ""
+        if not is_new:
+            return messages[-1]["content"]
+        return "\n\n".join(f"{m['role']}: {m['content']}" for m in messages)
+
+    # ---- primary_turn ----
+
+    async def primary_turn(
+        self,
+        hermes_session_id: str,
+        messages: list[Message],
+        *,
+        model: str,
+        cancel_token: CancelToken,
+        deadline: Optional[float] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
+        if self._closed:
+            raise errors.ClaudeCliError("adapter is closed")
+        if not self._inited:
+            raise errors.ClaudeCliError("adapter.init() has not been called")
+
+        lock = await self._get_session_lock(hermes_session_id)
+        if self.config.session_busy_policy == "reject" and lock.locked():
+            raise errors.SessionBusyError(
+                f"session {hermes_session_id!r} is busy and policy=reject"
+            )
+
+        async with lock:
+            async with self._primary_sem:
+                async for event in self._run_primary_turn(
+                    hermes_session_id=hermes_session_id,
+                    messages=messages,
+                    model=model,
+                    cancel_token=cancel_token,
+                    deadline=deadline,
+                ):
+                    yield event
+
+    async def _run_primary_turn(
+        self,
+        *,
+        hermes_session_id: str,
+        messages: list[Message],
+        model: str,
+        cancel_token: CancelToken,
+        deadline: Optional[float],
+    ) -> AsyncIterator[dict[str, Any]]:
+        claude_id, is_new = self._sessions.get_or_create(hermes_session_id)
+        settings_dir = self._ensure_settings_dir()
+        settings_path = write_settings_file(
+            generate_settings(
+                workspace_dir=self._resolved_workspace_dir(),
+                allowed_tools=self.config.allowed_tools,
+                disallowed_tools=self.config.disallowed_tools,
+            ),
+            parent_dir=settings_dir,
+        )
+        mcp_path = write_mcp_config_file(
+            generate_mcp_config(self.config.mcp_servers_allowlist),
+            parent_dir=settings_dir,
+        )
+        argv = self._build_primary_argv(
+            settings_path=settings_path,
+            mcp_path=mcp_path,
+            model=model,
+            claude_session_id=claude_id if not is_new else None,
+        )
+        prompt = self._format_prompt(messages, is_new=is_new)
+
+        proc = await spawn(
+            argv=argv,
+            env=self._spawn_env,
+            cwd=self.config.workspace_dir or None,
+            cancel_token=cancel_token,
+            cancel_grace_seconds=self.config.cancel_grace_seconds,
+        )
+
+        started_at = time.monotonic()
+        event_count = 0
+        logger.info(
+            "claude_cli.turn.start",
+            extra={
+                "hermes_session_id": hermes_session_id,
+                "claude_session_id": claude_id,
+                "model": model,
+                "pid": proc.pid,
+                "started_at": started_at,
+            },
+        )
+
+        async with proc:
+            # Feed stdin then close so claude knows the prompt is complete.
+            assert proc._proc.stdin is not None
+            try:
+                proc._proc.stdin.write(prompt.encode("utf-8"))
+                await proc._proc.stdin.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                # Child closed stdin early — surfaces as exit-with-error below.
+                pass
+            finally:
+                if not proc._proc.stdin.is_closing():
+                    proc._proc.stdin.close()
+
+            try:
+                async for event in self._stream_with_watchdog(
+                    proc, hermes_session_id, claude_id
+                ):
+                    event_count += 1
+                    yield event
+            except BaseException:
+                cancel_token.cancel()
+                raise
+
+        exit_code = proc.exit_code if proc.exit_code is not None else -1
+        duration_ms = int((time.monotonic() - started_at) * 1000)
+        if exit_code != 0:
+            stderr_digest = proc.stderr_digest
+            logger.info(
+                "claude_cli.turn.error",
+                extra={
+                    "hermes_session_id": hermes_session_id,
+                    "claude_session_id": self._sessions.get_or_create(
+                        hermes_session_id
+                    )[0],
+                    "exit_code": exit_code,
+                    "duration_ms": duration_ms,
+                    "event_count": event_count,
+                    "stderr_size": len(stderr_digest),
+                    "error_class": "ClaudeCliExited",
+                    "error_message_redacted": "subprocess non-zero exit",
+                },
+            )
+            raise errors.ClaudeCliExited(
+                exit_code=exit_code, stderr_digest=stderr_digest
+            )
+
+        logger.info(
+            "claude_cli.turn.end",
+            extra={
+                "hermes_session_id": hermes_session_id,
+                "claude_session_id": self._sessions.get_or_create(
+                    hermes_session_id
+                )[0],
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "event_count": event_count,
+                "stderr_size": len(proc.stderr_digest),
+            },
+        )
+
+    async def _stream_with_watchdog(
+        self,
+        proc,
+        hermes_session_id: str,
+        starting_claude_id: Optional[str],
+    ) -> AsyncIterator[dict[str, Any]]:
+        idle_timeout = self.config.turn_idle_timeout_seconds
+        event_iter = proc.events().__aiter__()
+        captured_id = starting_claude_id
+        while True:
+            try:
+                event = await asyncio.wait_for(
+                    event_iter.__anext__(), timeout=idle_timeout
+                )
+            except StopAsyncIteration:
+                return
+            except asyncio.TimeoutError as exc:
+                raise errors.ClaudeCliHung(
+                    f"no stream-json event for {idle_timeout:.1f}s on session "
+                    f"{hermes_session_id!r}"
+                ) from exc
+
+            if captured_id is None:
+                sid = event.get("session_id")
+                if isinstance(sid, str) and sid:
+                    self._sessions.set(hermes_session_id, sid)
+                    captured_id = sid
+
+            yield event
