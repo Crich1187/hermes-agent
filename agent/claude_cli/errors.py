@@ -59,3 +59,40 @@ class PromptTooLarge(ClaudeCliError):
 class SubprocessSpawnFailed(ClaudeCliError):
     """`asyncio.create_subprocess_exec` raised OSError (binary missing,
     permission denied, fork failure). The process never reached running state."""
+
+
+class ClaudeCliExited(ClaudeCliError):
+    """The ``claude`` subprocess exited with a non-zero status mid-turn.
+
+    Carries the exit code and the redacted stderr digest captured by the
+    PR 2 process layer so the caller can attach diagnostics to the
+    surfaced error.
+    """
+
+    def __init__(self, *, exit_code: int, stderr_digest: str) -> None:
+        super().__init__(
+            f"claude subprocess exited with code {exit_code}; "
+            f"stderr_digest={stderr_digest!r}"
+        )
+        self.exit_code = exit_code
+        self.stderr_digest = stderr_digest
+
+
+class ClaudeCliHung(ClaudeCliError):
+    """No stream-json event was observed within the per-turn idle deadline.
+
+    Raised by the adapter's per-turn watchdog after
+    ``turn_idle_timeout_seconds`` of silence. The subprocess group is
+    killed before the exception propagates.
+    """
+
+
+class ClaudeCliAuxTimeout(ClaudeCliError):
+    """An aux (one-shot) call exceeded ``aux_call_timeout_seconds`` or its
+    explicit ``deadline`` argument."""
+
+
+class SessionBusyError(ClaudeCliError):
+    """A primary turn was rejected because another turn for the same
+    Hermes session was already in flight and ``session_busy_policy`` is
+    set to ``"reject"``."""

@@ -15,13 +15,17 @@ TTL). PR 4 will glue them together into ``ClaudeCliAdapter``.
 
 from agent.claude_cli.errors import (
     ClaudeCliAuthMissing,
+    ClaudeCliAuxTimeout,
     ClaudeCliError,
+    ClaudeCliExited,
+    ClaudeCliHung,
     ClaudeCliIncompatible,
     ClaudeCliUnavailable,
     ClaudeCliVersionTooOld,
     HermesDirectAnthropicEgressDetected,
     ProtocolError,
     PromptTooLarge,
+    SessionBusyError,
     SubprocessSpawnFailed,
 )
 from agent.claude_cli.mcp_config import (
@@ -39,7 +43,10 @@ from agent.claude_cli.settings import (
 __all__ = [
     "CancelToken",
     "ClaudeCliAuthMissing",
+    "ClaudeCliAuxTimeout",
     "ClaudeCliError",
+    "ClaudeCliExited",
+    "ClaudeCliHung",
     "ClaudeCliIncompatible",
     "ClaudeCliUnavailable",
     "ClaudeCliVersionTooOld",
@@ -47,6 +54,7 @@ __all__ = [
     "HermesDirectAnthropicEgressDetected",
     "ProtocolError",
     "PromptTooLarge",
+    "SessionBusyError",
     "SessionStore",
     "SubprocessSpawnFailed",
     "generate_mcp_config",
