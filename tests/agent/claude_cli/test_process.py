@@ -6,6 +6,7 @@ import asyncio
 import os
 import signal
 import sys
+from typing import Any
 
 import pytest
 
@@ -297,3 +298,65 @@ class TestCancellation:
         except (ProcessLookupError, PermissionError):
             still_alive = False
         assert not still_alive
+
+
+class TestRealClaudeIntegration:
+    """End-to-end against the real claude binary.
+
+    Gated by ``HERMES_CLAUDE_CLI_INTEGRATION=1`` env var. Consumes Claude Max
+    plan tokens (one short prompt; pennies of equivalent API value).
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.skipif(
+        os.environ.get("HERMES_CLAUDE_CLI_INTEGRATION") != "1",
+        reason="set HERMES_CLAUDE_CLI_INTEGRATION=1 to run",
+    )
+    async def test_real_claude_basic_stream_invocation(self):
+        from agent.claude_cli.probe import (
+            check_env_hygiene,
+            discover_binary,
+        )
+
+        # The conftest hermetic_environment fixture removes CLAUDE_CODE_OAUTH_TOKEN
+        # for all tests (it's a credential). For this integration test only,
+        # restore it from the backup captured before hermetic filtering started.
+        # This mimics the real production scenario where the token is available.
+        original_token = getattr(os, "HERMES_CLAUDE_TOKEN_BACKUP", None)
+        if original_token:
+            os.environ["CLAUDE_CODE_OAUTH_TOKEN"] = original_token
+
+        binary = discover_binary()
+        env = check_env_hygiene(dict(os.environ), require_token=True)
+
+        proc = await spawn(
+            argv=[
+                binary,
+                "-p",
+                "Reply with exactly one word: pong",
+                "--output-format", "stream-json",
+                "--verbose",
+                "--no-session-persistence",
+                "--allowedTools", "",
+            ],
+            env=env,
+        )
+        events: list[dict[str, Any]] = []
+        async with proc:
+            # Close stdin since we passed the prompt via argv (matches probe
+            # pattern for one-shot turns where no stdin is used).
+            if proc._proc.stdin is not None:
+                proc._proc.stdin.close()
+            async for ev in proc.events():
+                events.append(ev)
+            await proc.wait_until_exit()
+
+        assert proc.exit_code == 0, (
+            f"claude exited {proc.exit_code}; stderr digest: {proc.stderr_digest[:500]}"
+        )
+        assert any(e.get("type") == "assistant" for e in events), (
+            f"no assistant event; got types={[e.get('type') for e in events]}"
+        )
+        assert any(e.get("type") == "result" for e in events), (
+            f"no result event; got types={[e.get('type') for e in events]}"
+        )
