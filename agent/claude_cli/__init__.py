@@ -13,6 +13,7 @@ JSON), and ``session_store`` (in-memory hermes->claude session id map with
 TTL). PR 4 will glue them together into ``ClaudeCliAdapter``.
 """
 
+from agent.claude_cli.adapter import ClaudeCliAdapter, Message, ProviderConfig
 from agent.claude_cli.errors import (
     ClaudeCliAuthMissing,
     ClaudeCliAuxTimeout,
@@ -42,6 +43,7 @@ from agent.claude_cli.settings import (
 
 __all__ = [
     "CancelToken",
+    "ClaudeCliAdapter",
     "ClaudeCliAuthMissing",
     "ClaudeCliAuxTimeout",
     "ClaudeCliError",
@@ -52,7 +54,9 @@ __all__ = [
     "ClaudeCliVersionTooOld",
     "ClaudeProcess",
     "HermesDirectAnthropicEgressDetected",
+    "Message",
     "ProtocolError",
+    "ProviderConfig",
     "PromptTooLarge",
     "SessionBusyError",
     "SessionStore",

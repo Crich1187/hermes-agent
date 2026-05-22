@@ -1075,3 +1075,154 @@ class TestAuxCall:
             adapter.aux_call("c", model="m", deadline=10.0),
         )
         assert peak == 1
+
+
+class TestCloseAndCleanup:
+    @pytest.mark.asyncio
+    async def test_close_removes_settings_dir(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_one_event(session_id="claude-c"),
+                env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        async for _ in adapter.primary_turn(
+            hermes_session_id="h-close",
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            pass
+
+        dir_path = adapter._session_settings_dir
+        assert dir_path is not None and dir_path.exists()
+
+        await adapter.close()
+        assert not dir_path.exists()
+        assert adapter._closed is True
+
+    @pytest.mark.asyncio
+    async def test_close_is_idempotent(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        await adapter.close()
+        await adapter.close()  # second call must not raise
+
+    @pytest.mark.asyncio
+    async def test_close_cancels_inflight_turns(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            return await real_spawn(
+                _fake_claude_argv_hang(), env=env, cwd=cwd, **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(
+                shutdown_grace_seconds=0.5,
+                cancel_grace_seconds=0.5,
+                turn_idle_timeout_seconds=60.0,
+            ),
+            env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"},
+        )
+        await adapter.init()
+
+        async def run_turn() -> None:
+            with pytest.raises(BaseException):
+                async for _ in adapter.primary_turn(
+                    hermes_session_id="h-inflight",
+                    messages=[{"role": "user", "content": "x"}],
+                    model="claude-opus-4-6",
+                    cancel_token=CancelToken(),
+                ):
+                    pass
+
+        turn_task = asyncio.create_task(run_turn())
+        await asyncio.sleep(0.1)  # let the turn spawn
+        await adapter.close()
+        await asyncio.wait_for(turn_task, timeout=2.0)
+
+
+@pytest.mark.skipif(
+    not __import__("os").environ.get("HERMES_CLAUDE_CLI_INTEGRATION"),
+    reason="set HERMES_CLAUDE_CLI_INTEGRATION=1 to run against the real claude binary",
+)
+class TestAdapterRealBinaryIntegration:
+    @pytest.mark.asyncio
+    async def test_one_primary_turn_and_close_against_real_claude(self) -> None:
+        import os
+
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        token_env = {
+            "PATH": os.environ.get("PATH", ""),
+            "HOME": os.environ.get("HOME", ""),
+            "CLAUDE_CODE_OAUTH_TOKEN": os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", ""),
+        }
+        if not token_env["CLAUDE_CODE_OAUTH_TOKEN"]:
+            pytest.skip("CLAUDE_CODE_OAUTH_TOKEN not available")
+
+        adapter = ClaudeCliAdapter(ProviderConfig(), env=token_env)
+        await adapter.init()
+        try:
+            saw_assistant = False
+            saw_result = False
+            async for event in adapter.primary_turn(
+                hermes_session_id="hermes-int-test",
+                messages=[{"role": "user", "content": "Reply with exactly one word: pong"}],
+                model="claude-opus-4-6",
+                cancel_token=CancelToken(),
+            ):
+                if event.get("type") == "assistant":
+                    saw_assistant = True
+                if event.get("type") == "result":
+                    saw_result = True
+            assert saw_assistant, "no assistant event from real claude"
+            assert saw_result, "no result event from real claude"
+        finally:
+            await adapter.close()

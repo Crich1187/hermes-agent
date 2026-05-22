@@ -236,16 +236,23 @@ class ClaudeCliAdapter:
                 f"session {hermes_session_id!r} is busy and policy=reject"
             )
 
-        async with lock:
-            async with self._primary_sem:
-                async for event in self._run_primary_turn(
-                    hermes_session_id=hermes_session_id,
-                    messages=messages,
-                    model=model,
-                    cancel_token=cancel_token,
-                    deadline=deadline,
-                ):
-                    yield event
+        task = asyncio.current_task()
+        if task is not None:
+            self._inflight.add(task)
+        try:
+            async with lock:
+                async with self._primary_sem:
+                    async for event in self._run_primary_turn(
+                        hermes_session_id=hermes_session_id,
+                        messages=messages,
+                        model=model,
+                        cancel_token=cancel_token,
+                        deadline=deadline,
+                    ):
+                        yield event
+        finally:
+            if task is not None:
+                self._inflight.discard(task)
 
     async def _run_primary_turn(
         self,
@@ -485,3 +492,32 @@ class ClaudeCliAdapter:
                 stderr_digest=proc.stderr_digest,
             )
         return "".join(assistant_text_parts)
+
+    async def close(self) -> None:
+        """Stop accepting new turns; drain in-flight up to ``shutdown_grace_seconds``;
+        force-cancel the rest; remove the per-session settings directory.
+
+        Idempotent.
+        """
+        if self._closed:
+            return
+        self._closed = True
+
+        # Snapshot the in-flight task set so additions don't perturb iteration.
+        inflight = list(self._inflight)
+        if inflight:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*inflight, return_exceptions=True),
+                    timeout=self.config.shutdown_grace_seconds,
+                )
+            except asyncio.TimeoutError:
+                for task in inflight:
+                    if not task.done():
+                        task.cancel()
+                # Best-effort final await; ignore further timeouts.
+                await asyncio.gather(*inflight, return_exceptions=True)
+
+        if self._session_settings_dir is not None and self._session_settings_dir.exists():
+            shutil.rmtree(self._session_settings_dir, ignore_errors=True)
+            self._session_settings_dir = None

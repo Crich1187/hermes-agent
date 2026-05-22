@@ -7,7 +7,7 @@ that direct-HTTPS callers hit.
 
 ## Status
 
-**PR 1 of 6 — landed. PR 2 of 6 — landed (process layer). PR 3 of 6 — landed (config + session).** Probe + protocol parser + CLI contract documentation + subprocess lifecycle + hermetic settings, mcp_config, session store.
+**PR 1 of 6 — landed. PR 2 of 6 — landed (process layer). PR 3 of 6 — landed (config + session). PR 4 of 6 — landed (adapter).** Probe + protocol parser + CLI contract documentation + subprocess lifecycle + hermetic settings, mcp_config, session store + `ClaudeCliAdapter` orchestration.
 The adapter itself is not yet wired into Hermes' provider runtime; see
 `docs/superpowers/specs/2026-05-16-hermes-claude-code-cli-adapter-design.md`
 for the full plan and v1 scope.
@@ -26,11 +26,11 @@ Subsequent PRs (not yet landed):
 
 - PR 2: `process.py` — subprocess spawn / drain / kill primitives. **Landed.**
 - PR 3: `settings.py`, `mcp_config.py`, `session_store.py`. **Landed.**
-- PR 4: `adapter.py` — the provider adapter, registered as `claude_code_cli`.
+- PR 4: `adapter.py` — the provider adapter, registered as `claude_code_cli`. **Landed (not yet selectable as `model.provider`; PR 5 wires that.)**
 - PR 5: end-to-end wiring; `model.provider: claude-code-subprocess` becomes selectable.
 - PR 6 (optional): cross-provider fallback behavior.
 
-## What ships in PR 1 + PR 2 + PR 3
+## What ships in PR 1 + PR 2 + PR 3 + PR 4
 
 | Module | Purpose |
 |---|---|
@@ -41,6 +41,7 @@ Subsequent PRs (not yet landed):
 | `settings.py` | `generate_settings(...)` + `write_settings_file(...)` + `make_session_settings_dir(...)`: hermetic ``--settings`` JSON file generator. Restrictive default-deny tool permissions; 0600 file inside 0700 per-session tempdir. |
 | `mcp_config.py` | `generate_mcp_config(...)` + `write_mcp_config_file(...)`: ``--mcp-config`` JSON file generator. Empty-by-default allowlist; same 0600/0700 filesystem semantics. |
 | `session_store.py` | `SessionStore` class: in-memory ``hermes_session_id -> claude_session_id`` map with TTL eviction (`time.monotonic()` clock, injectable `now`). v1 in-memory only; persistence is a follow-up. |
+| `adapter.py` | `ClaudeCliAdapter` (init / primary_turn / aux_call / close) + `ProviderConfig` dataclass + `Message` TypedDict. Glues PRs 1–3 into one provider unit. |
 
 ## Running the probe
 
@@ -152,6 +153,41 @@ else:
 
 # House-keeping (call periodically, e.g. from a Hermes maintenance loop):
 store.evict_expired()
+```
+
+## PR 4 usage example
+
+```python
+import asyncio
+import os
+
+from agent.claude_cli import ClaudeCliAdapter, ProviderConfig
+from agent.claude_cli.process import CancelToken
+
+
+async def main() -> None:
+    env = dict(os.environ)
+    adapter = ClaudeCliAdapter(ProviderConfig(), env=env)
+    await adapter.init()
+    try:
+        # Primary streaming turn (resumable across calls).
+        async for event in adapter.primary_turn(
+            hermes_session_id="user-42",
+            messages=[{"role": "user", "content": "Say pong."}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            print(event.get("type"))
+        # One-shot aux call (compression / title / etc., no session memory).
+        summary = await adapter.aux_call(
+            "Summarize the last paragraph.", model="claude-haiku", deadline=10.0,
+        )
+        print(summary)
+    finally:
+        await adapter.close()
+
+
+asyncio.run(main())
 ```
 
 ## Test coverage
