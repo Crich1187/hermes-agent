@@ -28,3 +28,47 @@ testable but not reachable via `model.provider`.
 """
 
 from __future__ import annotations
+
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal, TypedDict
+
+
+@dataclass
+class ProviderConfig:
+    """Runtime config for ClaudeCliAdapter (mirrors the YAML shape).
+
+    Owned locally by the claude_cli package in PR 4. PR 5 wires Hermes'
+    YAML reader to instantiate this; the provider registry receives the
+    populated dataclass and constructs the adapter.
+    """
+
+    binary: str = "claude"
+    min_version: tuple[int, int, int] = (2, 1, 143)
+    primary_concurrency: int = 8
+    aux_concurrency: int = 4
+    turn_idle_timeout_seconds: float = 120.0
+    aux_call_timeout_seconds: float = 60.0
+    cancel_grace_seconds: float = 5.0
+    shutdown_grace_seconds: float = 30.0
+    session_busy_policy: str = "queue"  # "queue" | "reject"
+    mcp_servers_allowlist: list[dict] = field(default_factory=list)
+    allowed_tools: list[str] = field(default_factory=list)
+    disallowed_tools: list[str] = field(
+        default_factory=lambda: ["Bash", "Write", "Edit", "WebFetch", "WebSearch"]
+    )
+    strip_env: list[str] = field(default_factory=lambda: ["ANTHROPIC_API_KEY"])
+    cross_provider_fallback: bool = False
+    probe_cache_seconds: float = 86400.0
+    probe_cache_path: Path = field(
+        default_factory=lambda: Path.home() / ".hermes/cache/claude_cli_probe.json"
+    )
+    workspace_dir: str = ""
+    session_ttl_seconds: float = 86400.0
+    adapter_code_version: str = "0.4.0"
+
+
+class Message(TypedDict):
+    role: Literal["user", "assistant", "system"]
+    content: str
