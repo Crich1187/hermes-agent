@@ -38,3 +38,45 @@ class TestCancelToken:
         token.cancel()
         await asyncio.wait_for(waiter, timeout=1.0)
         assert waiter.done()
+
+
+class TestSpawnLifecycle:
+    @pytest.mark.asyncio
+    async def test_spawn_returns_claude_process(self):
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "exit 0"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert isinstance(proc, ClaudeProcess)
+        await proc.wait_until_exit()
+        assert proc.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_starts_new_process_group(self):
+        # The child must be a session leader (own pgid == own pid).
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "echo $$; sleep 0.1; exit 0"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.pid > 0
+        assert proc.pgid == proc.pid
+        await proc.wait_until_exit()
+        assert proc.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_spawn_propagates_oserror_as_spawn_failed(self):
+        with pytest.raises(errors.SubprocessSpawnFailed):
+            await spawn(
+                argv=["/nonexistent/binary/path/xyz"],
+                env={"PATH": "/usr/bin:/bin"},
+            )
+
+    @pytest.mark.asyncio
+    async def test_exit_code_is_none_while_running(self):
+        proc = await spawn(
+            argv=["/bin/sh", "-c", "sleep 0.5; exit 7"],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        assert proc.exit_code is None
+        await proc.wait_until_exit()
+        assert proc.exit_code == 7

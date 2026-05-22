@@ -64,9 +64,45 @@ class CancelToken:
 class ClaudeProcess:
     """One ``claude`` subprocess invocation. Construct via ``spawn()``."""
 
-    # Placeholders filled in by later tasks.
-    def __init__(self) -> None:
-        raise NotImplementedError("ClaudeProcess is constructed via spawn()")
+    def __init__(
+        self,
+        proc: asyncio.subprocess.Process,
+        *,
+        cancel_token: CancelToken,
+        cancel_grace_seconds: float,
+        stderr_digest_bytes: int,
+    ) -> None:
+        self._proc = proc
+        self._cancel_token = cancel_token
+        self._cancel_grace_seconds = cancel_grace_seconds
+        self._stderr_digest_bytes = stderr_digest_bytes
+        self._pgid = proc.pid  # start_new_session=True → pgid == pid
+        self._cancelled_kill_done = False
+        self._stderr_buf: deque[bytes] = deque()
+        self._stderr_bytes_seen = 0
+        self._stdout_task: Optional[asyncio.Task[None]] = None
+        self._stderr_task: Optional[asyncio.Task[None]] = None
+        self._wait_task: Optional[asyncio.Task[int]] = None
+        self._cancel_watcher: Optional[asyncio.Task[None]] = None
+        self._parser = StreamJsonParser()
+        self._event_queue: asyncio.Queue[Optional[dict[str, Any]]] = asyncio.Queue()
+        self._tasks_started = False
+
+    @property
+    def pid(self) -> int:
+        return self._proc.pid
+
+    @property
+    def pgid(self) -> int:
+        return self._pgid
+
+    @property
+    def exit_code(self) -> Optional[int]:
+        return self._proc.returncode
+
+    async def wait_until_exit(self) -> int:
+        """Block until the child exits. Returns the exit code."""
+        return await self._proc.wait()
 
 
 async def spawn(
@@ -82,4 +118,25 @@ async def spawn(
 
     Filled in by Task 2.
     """
-    raise NotImplementedError
+    if cancel_token is None:
+        cancel_token = CancelToken()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=cwd,
+            start_new_session=True,
+        )
+    except (OSError, FileNotFoundError) as exc:
+        raise errors.SubprocessSpawnFailed(
+            f"failed to spawn {argv[0]!r}: {exc}"
+        ) from exc
+    return ClaudeProcess(
+        proc,
+        cancel_token=cancel_token,
+        cancel_grace_seconds=cancel_grace_seconds,
+        stderr_digest_bytes=stderr_digest_bytes,
+    )
