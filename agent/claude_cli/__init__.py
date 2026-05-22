@@ -19,6 +19,7 @@ from agent.claude_cli.errors import (
     HermesDirectAnthropicEgressDetected,
     ProtocolError,
     PromptTooLarge,
+    SubprocessSpawnFailed,
 )
 from agent.claude_cli.process import CancelToken, ClaudeProcess, spawn
 
@@ -33,5 +34,6 @@ __all__ = [
     "HermesDirectAnthropicEgressDetected",
     "ProtocolError",
     "PromptTooLarge",
+    "SubprocessSpawnFailed",
     "spawn",
 ]
