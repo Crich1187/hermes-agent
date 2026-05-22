@@ -104,6 +104,92 @@ class ClaudeProcess:
         """Block until the child exits. Returns the exit code."""
         return await self._proc.wait()
 
+    def _start_tasks(self) -> None:
+        """Idempotently start stdout/stderr reader + wait tasks."""
+        if self._tasks_started:
+            return
+        self._tasks_started = True
+        self._stdout_task = asyncio.create_task(
+            self._drain_stdout(), name="claude-proc-stdout"
+        )
+        self._stderr_task = asyncio.create_task(
+            self._drain_stderr(), name="claude-proc-stderr"
+        )
+        self._wait_task = asyncio.create_task(
+            self._proc.wait(), name="claude-proc-wait"
+        )
+        self._cancel_watcher = asyncio.create_task(
+            self._watch_cancel(), name="claude-proc-cancel-watcher"
+        )
+
+    async def _drain_stdout(self) -> None:
+        assert self._proc.stdout is not None
+        try:
+            while True:
+                chunk = await self._proc.stdout.read(65536)
+                if not chunk:
+                    break
+                for event in self._parser.feed(chunk):
+                    await self._event_queue.put(event)
+            for event in self._parser.close():
+                await self._event_queue.put(event)
+        except errors.ProtocolError as exc:
+            logger.warning("stream-json protocol error: %s", exc)
+            # Signal end-of-stream; consumer's events() exits, __aexit__
+            # observes a non-zero exit_code or surfaces the parser failure.
+        finally:
+            await self._event_queue.put(None)  # sentinel
+
+    async def _drain_stderr(self) -> None:
+        assert self._proc.stderr is not None
+        while True:
+            chunk = await self._proc.stderr.read(65536)
+            if not chunk:
+                break
+            self._stderr_bytes_seen += len(chunk)
+            self._stderr_buf.append(chunk)
+            # Bound memory: keep only enough trailing bytes to render the digest.
+            while (
+                sum(len(b) for b in self._stderr_buf)
+                > self._stderr_digest_bytes * 2
+            ):
+                self._stderr_buf.popleft()
+
+    async def _watch_cancel(self) -> None:
+        """Wait for cancel; on signal, kill the process group."""
+        await self._cancel_token.wait()
+        await self._kill_process_group()
+
+    async def events(self) -> AsyncIterator[dict[str, Any]]:
+        """Yield parsed stream-json events until the subprocess closes stdout."""
+        self._start_tasks()
+        while True:
+            event = await self._event_queue.get()
+            if event is None:
+                return
+            yield event
+
+    @property
+    def stderr_digest(self) -> str:
+        """Redacted, length-capped stderr capture for logging.
+
+        Returns the trailing ``stderr_digest_bytes`` of stderr (UTF-8 with
+        replacement) prefixed with a ``[truncated N bytes]`` marker when the
+        full stderr exceeded the cap.
+        """
+        joined = b"".join(self._stderr_buf)
+        if not joined:
+            return ""
+        if self._stderr_bytes_seen <= self._stderr_digest_bytes:
+            return joined.decode("utf-8", errors="replace")
+        tail = joined[-self._stderr_digest_bytes :]
+        prefix = f"[truncated {self._stderr_bytes_seen - self._stderr_digest_bytes} bytes]\n"
+        return prefix + tail.decode("utf-8", errors="replace")
+
+    async def _kill_process_group(self) -> None:
+        """Stub — filled in by Task 5 (cancellation)."""
+        return
+
 
 async def spawn(
     argv: list[str],

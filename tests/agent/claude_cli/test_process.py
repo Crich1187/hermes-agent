@@ -80,3 +80,70 @@ class TestSpawnLifecycle:
         assert proc.exit_code is None
         await proc.wait_until_exit()
         assert proc.exit_code == 7
+
+
+class TestEventsAndStderr:
+    @pytest.mark.asyncio
+    async def test_events_yields_parsed_stdout_lines(self):
+        # Emit two NDJSON events on stdout.
+        script = (
+            'printf \'{"type":"assistant","data":"hi"}\\n\'; '
+            'printf \'{"type":"result","status":"ok"}\\n\''
+        )
+        proc = await spawn(
+            argv=["/bin/sh", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        events = []
+        async for ev in proc.events():
+            events.append(ev)
+        await proc.wait_until_exit()
+        assert [e["type"] for e in events] == ["assistant", "result"]
+        assert proc.exit_code == 0
+
+    @pytest.mark.asyncio
+    async def test_stderr_digest_captures_stderr(self):
+        script = "printf 'something went wrong\\n' >&2"
+        proc = await spawn(
+            argv=["/bin/sh", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        # Drain events to allow reader tasks to complete.
+        async for _ in proc.events():
+            pass
+        await proc.wait_until_exit()
+        assert "something went wrong" in proc.stderr_digest
+
+    @pytest.mark.asyncio
+    async def test_stderr_digest_is_bounded(self):
+        # Emit ~50KB on stderr; digest should cap at default 4096 bytes.
+        script = "python3 -c \"import sys; sys.stderr.write('x'*50000); sys.stderr.flush()\""
+        proc = await spawn(
+            argv=["/bin/sh", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        async for _ in proc.events():
+            pass
+        await proc.wait_until_exit()
+        # Digest must fit in stderr_digest_bytes (default 4096) plus a small
+        # truncation marker.
+        assert len(proc.stderr_digest) <= 4096 + 64
+
+    @pytest.mark.asyncio
+    async def test_events_tolerates_concurrent_stdout_and_stderr(self):
+        # Reader tasks must drain BOTH streams; if stderr blocks the OS pipe,
+        # stdout would never drain. Emit lots of stderr alongside two events.
+        script = (
+            'python3 -c "import sys; sys.stderr.write(\\"e\\"*200000); sys.stderr.flush()"; '
+            'printf \'{"type":"assistant","data":"hi"}\\n\'; '
+            'printf \'{"type":"result"}\\n\''
+        )
+        proc = await spawn(
+            argv=["/bin/sh", "-c", script],
+            env={"PATH": "/usr/bin:/bin"},
+        )
+        events = []
+        async for ev in proc.events():
+            events.append(ev)
+        await proc.wait_until_exit()
+        assert any(e["type"] == "result" for e in events)
