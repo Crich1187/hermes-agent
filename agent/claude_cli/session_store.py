@@ -77,3 +77,26 @@ class SessionStore:
     def forget(self, hermes_session_id: str) -> None:
         """Drop the mapping for ``hermes_session_id`` if present (no-op otherwise)."""
         self._entries.pop(hermes_session_id, None)
+
+    def evict_expired(self, *, now: Optional[float] = None) -> int:
+        """Remove entries whose age exceeds ``ttl_seconds``.
+
+        Args:
+            now: Monotonic-clock instant in seconds. Defaults to
+                ``time.monotonic()``; tests may pass an explicit value to
+                avoid sleeping for the TTL duration.
+
+        Returns:
+            The number of entries removed.
+        """
+        if now is None:
+            now = time.monotonic()
+        ttl = self._ttl_seconds
+        expired_keys = [
+            key
+            for key, entry in self._entries.items()
+            if (now - entry.inserted_at) >= ttl
+        ]
+        for key in expired_keys:
+            del self._entries[key]
+        return len(expired_keys)
