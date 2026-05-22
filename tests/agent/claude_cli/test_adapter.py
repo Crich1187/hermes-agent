@@ -84,3 +84,214 @@ class TestMessageTypedDict:
         msg: Message = {"role": "user", "content": "hello"}
         assert msg["role"] == "user"
         assert msg["content"] == "hello"
+
+
+import asyncio
+from pathlib import Path
+
+# We'll monkeypatch agent.claude_cli.adapter.run_probe; create a tiny stand-in.
+from agent.claude_cli.probe import ProbeResult
+
+
+def _ok_probe_result(binary_path: str = "/usr/local/bin/claude") -> ProbeResult:
+    # Matches ProbeResult's real fields from PR 1.
+    return ProbeResult(
+        cache_key="fake-cache-key",
+        binary_path=binary_path,
+        version=(2, 1, 143),
+        timestamp=0.0,
+        ok=True,
+        assertions={"basic_invocation": "ok"},
+        error=None,
+    )
+
+
+def _failed_probe_result(error: str) -> ProbeResult:
+    return ProbeResult(
+        cache_key="",
+        binary_path="",
+        version=(0, 0, 0),
+        timestamp=0.0,
+        ok=False,
+        assertions={},
+        error=error,
+    )
+
+
+class TestAdapterConstruction:
+    def test_construct_stores_config_and_env(self) -> None:
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        config = ProviderConfig(primary_concurrency=2, aux_concurrency=1)
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "tok", "PATH": "/usr/bin"}
+        adapter = ClaudeCliAdapter(config, env)
+
+        # Spot-check that config and env round-trip.
+        assert adapter.config is config
+        assert adapter.config.primary_concurrency == 2
+        # We don't assert env identity (the adapter may copy).
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in adapter._env
+
+    def test_construct_does_not_perform_io(self, tmp_path: Path) -> None:
+        # No subprocess, no file creation, no probe call at __init__.
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        config = ProviderConfig(
+            probe_cache_path=tmp_path / "probe.json",
+            workspace_dir=str(tmp_path),
+        )
+        env = {"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        adapter = ClaudeCliAdapter(config, env)
+
+        # Probe cache file must NOT exist yet (only init() can create it).
+        assert not (tmp_path / "probe.json").exists()
+        # _session_settings_dir is lazy.
+        assert adapter._session_settings_dir is None
+        assert adapter._closed is False
+
+
+class TestAdapterInit:
+    @pytest.mark.asyncio
+    async def test_init_ok_strips_anthropic_api_key_and_stores_spawn_env(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+
+        # Stub run_probe.
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        env = {
+            "CLAUDE_CODE_OAUTH_TOKEN": "real-token",
+            "ANTHROPIC_API_KEY": "sk-must-be-scrubbed",
+            "PATH": "/usr/bin",
+        }
+        caplog.set_level("WARNING")
+        adapter = ClaudeCliAdapter(ProviderConfig(), env)
+        await adapter.init()
+
+        assert "ANTHROPIC_API_KEY" not in adapter._spawn_env
+        assert adapter._spawn_env["CLAUDE_CODE_OAUTH_TOKEN"] == "real-token"
+        # A warning is logged because ANTHROPIC_API_KEY was present.
+        assert any(
+            "ANTHROPIC_API_KEY" in record.getMessage() for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_init_missing_oauth_token_raises_auth_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliAuthMissing
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(ProviderConfig(), env={})
+        with pytest.raises(ClaudeCliAuthMissing):
+            await adapter.init()
+
+    @pytest.mark.asyncio
+    async def test_init_probe_unavailable_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliUnavailable
+
+        async def fake_run_probe(_config):
+            return _failed_probe_result("ClaudeCliUnavailable: not on PATH")
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        with pytest.raises(ClaudeCliUnavailable):
+            await adapter.init()
+
+    @pytest.mark.asyncio
+    async def test_init_probe_version_too_old_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliVersionTooOld
+
+        async def fake_run_probe(_config):
+            return _failed_probe_result(
+                "ClaudeCliVersionTooOld: installed claude is 2.0.0"
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        with pytest.raises(ClaudeCliVersionTooOld):
+            await adapter.init()
+
+    @pytest.mark.asyncio
+    async def test_init_probe_egress_detected_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import HermesDirectAnthropicEgressDetected
+
+        async def fake_run_probe(_config):
+            return _failed_probe_result(
+                "HermesDirectAnthropicEgressDetected: leaked HTTPS"
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        with pytest.raises(HermesDirectAnthropicEgressDetected):
+            await adapter.init()
+
+    @pytest.mark.asyncio
+    async def test_init_probe_incompatible_propagates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliIncompatible
+
+        async def fake_run_probe(_config):
+            return _failed_probe_result("ClaudeCliIncompatible: no result event")
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        with pytest.raises(ClaudeCliIncompatible):
+            await adapter.init()
+
+    @pytest.mark.asyncio
+    async def test_init_unknown_probe_error_raises_claude_cli_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.errors import ClaudeCliError
+
+        async def fake_run_probe(_config):
+            return _failed_probe_result("UnknownErrorClass: weird")
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        with pytest.raises(ClaudeCliError):
+            await adapter.init()

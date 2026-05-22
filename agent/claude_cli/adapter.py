@@ -29,10 +29,26 @@ testable but not reachable via `model.provider`.
 
 from __future__ import annotations
 
-
+import asyncio
+import logging
+import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, TypedDict
+from typing import Any, AsyncIterator, Literal, Optional, TypedDict
+
+from agent.claude_cli import errors
+from agent.claude_cli.mcp_config import generate_mcp_config, write_mcp_config_file
+from agent.claude_cli.probe import ProbeConfig, ProbeResult, run_probe
+from agent.claude_cli.process import CancelToken, spawn
+from agent.claude_cli.session_store import SessionStore
+from agent.claude_cli.settings import (
+    generate_settings,
+    make_session_settings_dir,
+    write_settings_file,
+)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -72,3 +88,78 @@ class ProviderConfig:
 class Message(TypedDict):
     role: Literal["user", "assistant", "system"]
     content: str
+
+
+_PROBE_ERROR_CLASS_MAP: dict[str, type[errors.ClaudeCliError]] = {
+    "ClaudeCliUnavailable": errors.ClaudeCliUnavailable,
+    "ClaudeCliVersionTooOld": errors.ClaudeCliVersionTooOld,
+    "ClaudeCliAuthMissing": errors.ClaudeCliAuthMissing,
+    "ClaudeCliIncompatible": errors.ClaudeCliIncompatible,
+    "HermesDirectAnthropicEgressDetected": errors.HermesDirectAnthropicEgressDetected,
+    "ProtocolError": errors.ProtocolError,
+}
+
+
+def _raise_from_probe_failure(result: ProbeResult) -> None:
+    """Re-materialise a typed exception from a failed ProbeResult."""
+    err = result.error or ""
+    class_name, _, message = err.partition(": ")
+    cls = _PROBE_ERROR_CLASS_MAP.get(class_name, errors.ClaudeCliError)
+    raise cls(message or err or "probe failed without a message")
+
+
+class ClaudeCliAdapter:
+    """Adapter that routes Hermes calls through the ``claude`` CLI subprocess."""
+
+    def __init__(self, config: ProviderConfig, env: dict[str, str]) -> None:
+        self.config = config
+        self._env: dict[str, str] = dict(env)
+        self._spawn_env: dict[str, str] = {}  # populated by init()
+        self._sessions = SessionStore(ttl_seconds=config.session_ttl_seconds)
+        self._primary_sem = asyncio.Semaphore(config.primary_concurrency)
+        self._aux_sem = asyncio.Semaphore(config.aux_concurrency)
+        self._session_locks: dict[str, asyncio.Lock] = {}
+        self._session_locks_guard = asyncio.Lock()
+        self._session_settings_dir: Optional[Path] = None
+        self._inflight: set[asyncio.Task[Any]] = set()
+        self._closed: bool = False
+        self._inited: bool = False
+
+    async def init(self) -> None:
+        """Run the probe, scrub the env, populate ``_spawn_env``."""
+        if self._inited:
+            return
+
+        from agent.claude_cli.probe import check_env_hygiene
+
+        if "ANTHROPIC_API_KEY" in self._env:
+            logger.warning(
+                "ANTHROPIC_API_KEY present in adapter env; stripping from "
+                "subprocess env per spec lifecycle table",
+                extra={"strip_env": self.config.strip_env},
+            )
+
+        try:
+            sanitized = check_env_hygiene(
+                self._env,
+                require_token=True,
+                strip_env=list(self.config.strip_env),
+            )
+        except errors.ClaudeCliAuthMissing:
+            raise
+
+        probe_config = ProbeConfig(
+            min_version=self.config.min_version,
+            cache_path=self.config.probe_cache_path,
+            adapter_code_version=self.config.adapter_code_version,
+            binary_path=self.config.binary if self.config.binary != "claude" else None,
+            require_token=True,
+            strip_env=tuple(self.config.strip_env),
+            cache_ttl_seconds=self.config.probe_cache_seconds,
+        )
+        result = await run_probe(probe_config)
+        if not result.ok:
+            _raise_from_probe_failure(result)
+
+        self._spawn_env = sanitized
+        self._inited = True
