@@ -427,3 +427,102 @@ class TestPrimaryTurnHappyPath:
         messages = [r.getMessage() for r in caplog.records]
         assert any("claude_cli.turn.start" in m for m in messages)
         assert any("claude_cli.turn.end" in m for m in messages)
+
+
+class TestPrimaryTurnResume:
+    @pytest.mark.asyncio
+    async def test_second_turn_passes_resume_with_captured_session_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        captured_argv: list[list[str]] = []
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            captured_argv.append(list(argv))
+            return await real_spawn(
+                _fake_claude_argv_one_event(session_id="claude-session-RESUMED"),
+                env=env,
+                cwd=cwd,
+                **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        # First turn populates the session store.
+        async for _ in adapter.primary_turn(
+            hermes_session_id="hermes-resume",
+            messages=[{"role": "user", "content": "first"}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            pass
+
+        # Second turn must pass --resume <claude-session-RESUMED>.
+        async for _ in adapter.primary_turn(
+            hermes_session_id="hermes-resume",
+            messages=[{"role": "user", "content": "second"}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            pass
+
+        assert len(captured_argv) == 2
+        first, second = captured_argv
+        assert "--resume" not in first
+        assert "--resume" in second
+        idx = second.index("--resume")
+        assert second[idx + 1] == "claude-session-RESUMED"
+
+    @pytest.mark.asyncio
+    async def test_unknown_hermes_session_starts_as_new(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from agent.claude_cli import adapter as adapter_mod
+        from agent.claude_cli.adapter import ClaudeCliAdapter, ProviderConfig
+        from agent.claude_cli.process import CancelToken
+
+        async def fake_run_probe(_config):
+            return _ok_probe_result()
+
+        captured_argv: list[list[str]] = []
+        real_spawn = adapter_mod.spawn
+
+        async def fake_spawn(argv, env, cwd=None, **kw):
+            captured_argv.append(list(argv))
+            return await real_spawn(
+                _fake_claude_argv_one_event(session_id="claude-a"),
+                env=env,
+                cwd=cwd,
+                **kw,
+            )
+
+        monkeypatch.setattr(adapter_mod, "run_probe", fake_run_probe)
+        monkeypatch.setattr(adapter_mod, "spawn", fake_spawn)
+
+        adapter = ClaudeCliAdapter(
+            ProviderConfig(), env={"CLAUDE_CODE_OAUTH_TOKEN": "tok"}
+        )
+        await adapter.init()
+
+        async for _ in adapter.primary_turn(
+            hermes_session_id="hermes-DIFFERENT",
+            messages=[{"role": "user", "content": "hi"}],
+            model="claude-opus-4-6",
+            cancel_token=CancelToken(),
+        ):
+            pass
+
+        assert "--resume" not in captured_argv[0]
