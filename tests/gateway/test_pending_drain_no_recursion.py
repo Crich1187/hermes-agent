@@ -49,7 +49,7 @@ class _StubAdapter(BasePlatformAdapter):
 
 
 def _make_adapter():
-    adapter = _StubAdapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    adapter = _StubAdapter(PlatformConfig(enabled=True, token=""), Platform.TELEGRAM)
     adapter._send_with_retry = AsyncMock(return_value=None)
     return adapter
 
@@ -91,31 +91,42 @@ async def test_in_band_drain_does_not_grow_stack():
     Pre-fix, depths would be 1, 2, 3, …, N; post-fix, depths are 1
     every time because each drain runs in its own task.
     """
+    # Keep the worker busy long enough that the old fixed 4s polling window
+    # cannot merely win a favorable scheduling race.  This is load-shaped:
+    # each hand-off has to yield and later resume under the package runner's
+    # four xdist workers.
     N = 12
+    per_turn_delay = 0.8
     adapter = _make_adapter()
     sk = _sk()
 
     depths: list[int] = []
     next_index = [1]
+    final_handler_returned = asyncio.Event()
 
     async def handler(event):
         depths.append(_count_pmb_frames())
         if next_index[0] < N:
             adapter._pending_messages[sk] = _make_event(text=f"M{next_index[0]}")
             next_index[0] += 1
+        await asyncio.sleep(per_turn_delay)
+        if len(depths) == N:
+            final_handler_returned.set()
         return "ok"
 
     adapter._message_handler = handler
 
     await adapter.handle_message(_make_event(text="M0"))
 
-    # Drain the chain.  Each turn schedules the next via the in-band
-    # drain block, so we wait until N handler runs have completed and
-    # the session has been released.
-    for _ in range(400):
-        if len(depths) >= N and sk not in adapter._active_sessions:
-            break
-        await asyncio.sleep(0.01)
+    # The old 400 x 10ms poll was only a scheduling-dependent guess: under
+    # load it could expire while a correct drain chain was still running, and
+    # cancel_background_tasks() then made it look as if M12 was lost.  Wait
+    # for the final handler instead, then await its registered task.  A task
+    # only completes after its finally block releases the session guard.
+    await asyncio.wait_for(final_handler_returned.wait(), timeout=N * per_turn_delay + 5)
+    terminal_task = adapter._session_tasks.get(sk)
+    assert terminal_task is not None, "final pending-drain task was not registered"
+    await asyncio.wait_for(terminal_task, timeout=5)
 
     await adapter.cancel_background_tasks()
 
