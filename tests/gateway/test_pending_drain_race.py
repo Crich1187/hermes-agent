@@ -187,7 +187,18 @@ async def test_finally_cleanup_drains_late_arrival_pending():
 @pytest.mark.asyncio
 async def test_no_pending_cleans_up_normally():
     """Regression guard: when no pending message exists, the finally
-    block must still delete _active_sessions as before (no leak)."""
+    block must still delete _active_sessions as before (no leak).
+
+    root-6t6g: this used to poll _active_sessions on a fixed 50 x 10ms
+    wall-clock budget, which raced real scheduling latency (e.g. under
+    xdist/full-suite CPU contention) rather than testing the cleanup
+    contract itself — the finally block was never actually losing the
+    cleanup, the poll just sometimes gave up before it ran. Awaiting
+    the background task directly is deterministic: Task.done() can only
+    become true after the coroutine's finally block (which deletes
+    _active_sessions[sk]) has fully executed, so there is no race left
+    to be flaky about.
+    """
     adapter = _make_adapter()
     sk = _sk()
 
@@ -198,11 +209,16 @@ async def test_no_pending_cleans_up_normally():
 
     await adapter.handle_message(_make_event(text="solo"))
 
-    # Wait for background task to finish.
-    for _ in range(50):
-        if sk not in adapter._active_sessions:
-            break
-        await asyncio.sleep(0.01)
+    # handle_message() installs the background task in _session_tasks
+    # synchronously (via _start_session_processing) before returning, so
+    # it's already present here — no poll needed to find it.
+    task = adapter._session_tasks.get(sk)
+    assert task is not None, "handle_message did not register a session task"
+
+    # Bounded generously so a genuinely wedged cleanup still fails loudly
+    # instead of hanging the suite, but this is a ceiling, not a poll
+    # interval — the await returns as soon as the task actually finishes.
+    await asyncio.wait_for(task, timeout=5.0)
 
     assert sk not in adapter._active_sessions, (
         "_active_sessions was not cleaned up after a normal turn with no pending"
