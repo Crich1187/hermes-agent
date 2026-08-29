@@ -7339,6 +7339,8 @@ class GatewayRunner:
             _hyg_threshold_pct = 0.85
             _hyg_compression_enabled = True
             _hyg_hard_msg_limit = 400
+            _hyg_timeout_seconds = 30.0
+            _hyg_failure_cooldown_seconds = 300.0
             _hyg_config_context_length = None
             _hyg_provider = None
             _hyg_base_url = None
@@ -7379,6 +7381,22 @@ class GatewayRunner:
                                 _parsed = int(_raw_hard_limit)
                                 if _parsed > 0:
                                     _hyg_hard_msg_limit = _parsed
+                            except (TypeError, ValueError):
+                                pass
+                        _raw_timeout = _comp_cfg.get("hygiene_timeout_seconds")
+                        if _raw_timeout is not None:
+                            try:
+                                _parsed = float(_raw_timeout)
+                                if _parsed > 0:
+                                    _hyg_timeout_seconds = _parsed
+                            except (TypeError, ValueError):
+                                pass
+                        _raw_cooldown = _comp_cfg.get("hygiene_failure_cooldown_seconds")
+                        if _raw_cooldown is not None:
+                            try:
+                                _parsed = float(_raw_cooldown)
+                                if _parsed >= 0:
+                                    _hyg_failure_cooldown_seconds = _parsed
                             except (TypeError, ValueError):
                                 pass
 
@@ -7511,15 +7529,65 @@ class GatewayRunner:
                                 )
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
+                                    _hyg_cleanup_deferred = False
 
                                     loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
+                                    _hyg_future = loop.run_in_executor(
                                         None,
                                         lambda: _hyg_agent._compress_context(
                                             _hyg_msgs, "",
                                             approx_tokens=_approx_tokens,
                                         ),
                                     )
+                                    try:
+                                        _compressed, _ = await asyncio.wait_for(
+                                            asyncio.shield(_hyg_future),
+                                            timeout=_hyg_timeout_seconds,
+                                        )
+                                    except asyncio.TimeoutError:
+                                        _hyg_cleanup_deferred = True
+
+                                        def _cleanup_after_hygiene_timeout(_future):
+                                            try:
+                                                loop.call_soon_threadsafe(
+                                                    self._cleanup_agent_resources,
+                                                    _hyg_agent,
+                                                )
+                                            except RuntimeError:
+                                                pass
+
+                                        _hyg_future.add_done_callback(
+                                            _cleanup_after_hygiene_timeout
+                                        )
+                                        _session_db = getattr(self, "_session_db", None)
+                                        _session_db = getattr(
+                                            _session_db, "_db", _session_db
+                                        )
+                                        _record_cooldown = getattr(
+                                            _session_db,
+                                            "record_compression_failure_cooldown",
+                                            None,
+                                        )
+                                        if _record_cooldown is not None:
+                                            try:
+                                                _record_cooldown(
+                                                    session_entry.session_id,
+                                                    time.time()
+                                                    + _hyg_failure_cooldown_seconds,
+                                                    "session hygiene compression timed out",
+                                                )
+                                            except Exception as _cooldown_error:
+                                                logger.debug(
+                                                    "Session hygiene cooldown persist failed: %s",
+                                                    _cooldown_error,
+                                                )
+                                        logger.warning(
+                                            "Session hygiene compression for session %s timed "
+                                            "out after %.3fs; continuing without compression",
+                                            session_entry.session_id,
+                                            _hyg_timeout_seconds,
+                                        )
+                                        raise
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
@@ -7611,8 +7679,11 @@ class GatewayRunner:
                                     # rebuilds its system prompt from current
                                     # SOUL.md, memory, and skills.
                                     self._evict_cached_agent(session_key)
-                                    self._cleanup_agent_resources(_hyg_agent)
+                                    if not _hyg_cleanup_deferred:
+                                        self._cleanup_agent_resources(_hyg_agent)
 
+                    except asyncio.TimeoutError:
+                        pass
                     except Exception as e:
                         logger.warning(
                             "Session hygiene auto-compress failed: %s", e
