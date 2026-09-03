@@ -373,11 +373,19 @@ mcp_servers:
       client_metadata_url: "https://example.com/my-cimd.json"  # self-hosted document
       cimd: false                                              # force DCR
       user_agent: "My-MCP-Client/1.0"                          # token-request User-Agent
+      token_endpoint_headers_env:                              # token requests only
+        x-litellm-api-key: "LITELLM_KEY_HERMES"                # value read from env
+      authorization_response_issuer_aliases:                   # exact gateway rewrite
+        "https://auth.example.com/oauth": "https://gateway.example.com/mcp"
 ```
 
 `client_metadata_url` must be an HTTPS URL with a path (no bare origin, no fragment, no userinfo, no `.`/`..` segments) that returns `200` and `Content-Type: application/json` with **no redirect** — authorization servers are forbidden from following redirects when fetching it. Hermes still pins its callback to the same `27890`–`27894` range, so a self-hosted document must declare all ten loopback URIs (`http://127.0.0.1:<port>/callback` and `http://localhost:<port>/callback` for each port), and its `client_id` must be its own URL.
 
-`user_agent` replaces the HTTP library's default `User-Agent` on **token-endpoint requests only** (authorization-code exchange and refresh) — some authorization servers and WAFs reject the default `python-httpx/...` value there. It never applies to MCP traffic or OAuth discovery, and no other token-request headers are configurable. Empty or null values are ignored.
+`user_agent` replaces the HTTP library's default `User-Agent` on **token-endpoint requests only** (authorization-code exchange and refresh) — some authorization servers and WAFs reject the default `python-httpx/...` value there. It never applies to MCP traffic or OAuth discovery. Empty or null values are ignored.
+
+`token_endpoint_headers_env` maps token-request header names to environment variable names. Hermes resolves each value from the process environment and applies it only to authorization-code and refresh-token requests. This supports gateways that require a separate client credential at their token endpoint without storing that credential in `config.yaml`. Hermes fails closed when a referenced variable is unset or invalid.
+
+`authorization_response_issuer_aliases` is an explicit mapping for OAuth gateways whose public metadata identifies the gateway as issuer while the upstream authorization server returns its own RFC 9207 `iss` value. Hermes rewrites only an exact configured upstream issuer to the configured gateway issuer; the SDK then performs its normal issuer validation. Both sides must be HTTPS issuer URLs. Unmatched issuers remain unchanged and are rejected normally.
 
 ## Add to Hermes link
 

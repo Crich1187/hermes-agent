@@ -916,7 +916,10 @@ async def _wait_for_callback() -> tuple[str, str | None]:
 
 
 def _make_callback_waiter(
-    port: int, cimd_url: str | None = None, timeout: float = 300.0
+    port: int,
+    cimd_url: str | None = None,
+    timeout: float = 300.0,
+    issuer_aliases: "dict[str, str] | None" = None,
 ):
     """Return a callback waiter bound to a single OAuth flow's port.
 
@@ -936,6 +939,12 @@ def _make_callback_waiter(
     fetches the document and refuses it aborts at the *authorization*
     endpoint (draft section 5.1), so no redirect ever reaches us and a bare
     "timed out" hides the real cause.
+
+    ``issuer_aliases`` contains explicit, exact authorization-response issuer
+    rewrites for gateways whose public OAuth metadata uses the gateway issuer
+    while the upstream authorization server emits its own RFC 9207 ``iss``.
+    The rewritten value is still validated by the SDK against the discovered
+    gateway issuer; unmatched values are left intact and rejected normally.
 
     The waiter polls for the redirect without blocking the event loop. On an
     interactive TTY it races the HTTP listener against a stdin paste fallback
@@ -1063,8 +1072,11 @@ def _make_callback_waiter(
                 "Ensure you completed the browser authorization flow." + hint
             )
 
+        response_iss = normalize_authorization_response_issuer(
+            result.get("iss"), issuer_aliases or {}
+        )
         return _authorization_code_result(
-            result["auth_code"], result["state"], result.get("iss")
+            result["auth_code"], result["state"], response_iss
         )
 
     return _wait
@@ -1184,16 +1196,28 @@ def _get_hermes_oauth_provider_class() -> type | None:
         ``token_user_agent`` (from ``oauth.user_agent``) is stamped onto the
         token-endpoint requests the SDK builds — some authorization servers
         and WAFs reject httpx's default User-Agent there (#75576).
+
+        ``token_headers`` contains values resolved from environment variables;
+        those headers are limited to token exchange and refresh requests.
         """
 
-        def __init__(self, *args: Any, token_user_agent: "str | None" = None, **kwargs: Any):
+        def __init__(
+            self,
+            *args: Any,
+            token_user_agent: "str | None" = None,
+            token_headers: "dict[str, str] | None" = None,
+            **kwargs: Any,
+        ):
             super().__init__(*args, **kwargs)
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_token_headers = dict(token_headers or {})
 
-        def _stamp_token_user_agent(self, request):
+        def _stamp_token_request_headers(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
             if ua:
                 request.headers["User-Agent"] = ua
+            for name, value in getattr(self, "_hermes_token_headers", {}).items():
+                request.headers[name] = value
             return request
 
         def _coerce_client_secret_post(self) -> None:
@@ -1210,12 +1234,12 @@ def _get_hermes_oauth_provider_class() -> type | None:
         async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
             self._coerce_client_secret_post()
             request = await super()._exchange_token_authorization_code(*args, **kwargs)
-            return self._stamp_token_user_agent(request)
+            return self._stamp_token_request_headers(request)
 
         async def _refresh_token(self):
             self._coerce_client_secret_post()
             request = await super()._refresh_token()
-            return self._stamp_token_user_agent(request)
+            return self._stamp_token_request_headers(request)
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -1524,8 +1548,7 @@ def token_request_user_agent(cfg: dict) -> str | None:
     opt-in and per-server; anything that is not a non-empty string is
     treated as unset so a null/empty YAML value never sends a blank header.
     Applied ONLY to authorization-code exchange and refresh-token requests —
-    never to MCP traffic or discovery, and no other headers are configurable
-    (arbitrary token headers risk secrets landing in config.yaml).
+    never to MCP traffic or discovery.
     """
     ua = cfg.get("user_agent")
     if isinstance(ua, str):
@@ -1533,6 +1556,123 @@ def token_request_user_agent(cfg: dict) -> str | None:
         if ua:
             return ua
     return None
+
+
+_TOKEN_HEADER_NAME_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
+_ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_TOKEN_HEADER_NAMES = frozenset(
+    {
+        "authorization",
+        "connection",
+        "content-length",
+        "host",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "user-agent",
+    }
+)
+
+
+def authorization_response_issuer_aliases(cfg: dict) -> dict[str, str]:
+    """Return exact RFC 9207 issuer rewrites configured for an OAuth gateway."""
+    raw = cfg.get("authorization_response_issuer_aliases")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "oauth.authorization_response_issuer_aliases must be a mapping"
+        )
+
+    aliases: dict[str, str] = {}
+    for upstream_issuer, gateway_issuer in raw.items():
+        for role, value in (
+            ("upstream", upstream_issuer),
+            ("gateway", gateway_issuer),
+        ):
+            if not isinstance(value, str):
+                raise ValueError(
+                    "oauth.authorization_response_issuer_aliases must map "
+                    "HTTPS issuer URLs to HTTPS issuer URLs"
+                )
+            parsed = urlparse(value)
+            if (
+                parsed.scheme != "https"
+                or not parsed.hostname
+                or parsed.username is not None
+                or parsed.password is not None
+                or parsed.query
+                or parsed.fragment
+            ):
+                raise ValueError(
+                    "oauth.authorization_response_issuer_aliases contains an "
+                    f"invalid {role} issuer URL"
+                )
+        aliases[upstream_issuer] = gateway_issuer
+    return aliases
+
+
+def normalize_authorization_response_issuer(
+    issuer: str | None, aliases: dict[str, str]
+) -> str | None:
+    """Rewrite only an exact, explicitly trusted authorization issuer alias."""
+    if issuer is None:
+        return None
+    return aliases.get(issuer, issuer)
+
+
+def token_request_headers_from_env(cfg: dict) -> dict[str, str]:
+    """Resolve opt-in token-endpoint headers from environment variables.
+
+    ``oauth.token_endpoint_headers_env`` maps HTTP header names to environment
+    variable names. Only variable names are stored in config; resolved values
+    stay in process memory and are never written to disk.
+    """
+    raw = cfg.get("token_endpoint_headers_env")
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError("oauth.token_endpoint_headers_env must be a mapping")
+
+    resolved: dict[str, str] = {}
+    for header_name, env_name in raw.items():
+        if not isinstance(header_name, str) or not _TOKEN_HEADER_NAME_RE.fullmatch(
+            header_name
+        ):
+            raise ValueError(
+                "oauth.token_endpoint_headers_env contains an invalid header name"
+            )
+        if header_name.lower() in _RESERVED_TOKEN_HEADER_NAMES:
+            raise ValueError(
+                "oauth.token_endpoint_headers_env contains a reserved header name"
+            )
+        if not isinstance(env_name, str) or not _ENV_VAR_NAME_RE.fullmatch(env_name):
+            raise ValueError(
+                f"oauth.token_endpoint_headers_env.{header_name} must name an environment variable"
+            )
+        value = os.environ.get(env_name)
+        if not value:
+            raise ValueError(
+                f"oauth.token_endpoint_headers_env.{header_name} references "
+                f"unset environment variable {env_name}"
+            )
+        try:
+            value.encode("ascii")
+        except UnicodeEncodeError:
+            raise ValueError(
+                f"oauth token header environment variable {env_name} must contain ASCII"
+            ) from None
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in value):
+            raise ValueError(
+                f"oauth token header environment variable {env_name} contains "
+                "a control character"
+            )
+        resolved[header_name] = value
+    return resolved
 
 
 def _configure_callback_port(
@@ -1932,7 +2072,10 @@ def build_oauth_auth(
         resolved_port, redirect_uri=cfg.get("redirect_uri") or None
     )
     callback_handler = _make_callback_waiter(
-        resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))
+        resolved_port,
+        cfg.get("_cimd_url"),
+        timeout=float(cfg.get("timeout", 300)),
+        issuer_aliases=authorization_response_issuer_aliases(cfg),
     )
 
     provider_class = _get_hermes_oauth_provider_class()
@@ -1953,5 +2096,6 @@ def build_oauth_auth(
         # where the browser round-trip is actually awaited.
         callback_handler=callback_handler,
         token_user_agent=token_request_user_agent(cfg),
+        token_headers=token_request_headers_from_env(cfg),
         **cimd_provider_kwargs(cfg),
     )

@@ -135,6 +135,7 @@ def _make_hermes_provider_class() -> Optional[type]:
             server_name: str = "",
             preregistered: bool = False,
             token_user_agent: "str | None" = None,
+            token_headers: "dict[str, str] | None" = None,
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
@@ -158,11 +159,14 @@ def _make_hermes_provider_class() -> Optional[type]:
             # oauth.user_agent — stamped onto token-endpoint requests only;
             # some authorization servers/WAFs reject httpx's default (#75576).
             self._hermes_token_user_agent = token_user_agent
+            self._hermes_token_headers = dict(token_headers or {})
 
-        def _stamp_token_user_agent(self, request):
+        def _stamp_token_request_headers(self, request):
             ua = getattr(self, "_hermes_token_user_agent", None)
             if ua:
                 request.headers["User-Agent"] = ua
+            for name, value in getattr(self, "_hermes_token_headers", {}).items():
+                request.headers[name] = value
             return request
 
         def _coerce_client_secret_post(self) -> None:
@@ -191,12 +195,12 @@ def _make_hermes_provider_class() -> Optional[type]:
         async def _exchange_token_authorization_code(self, *args: Any, **kwargs: Any):
             self._coerce_client_secret_post()
             request = await super()._exchange_token_authorization_code(*args, **kwargs)
-            return self._stamp_token_user_agent(request)
+            return self._stamp_token_request_headers(request)
 
         async def _refresh_token(self):
             self._coerce_client_secret_post()
             request = await super()._refresh_token()
-            return self._stamp_token_user_agent(request)
+            return self._stamp_token_request_headers(request)
 
         async def _handle_token_response(self, response):
             """Accept any 2xx token response and avoid leaking token bodies in errors."""
@@ -712,7 +716,9 @@ class MCPOAuthManager:
             _maybe_preregister_client,
             _make_callback_waiter,
             _make_redirect_handler,
+            authorization_response_issuer_aliases,
             cimd_provider_kwargs,
+            token_request_headers_from_env,
             token_request_user_agent,
         )
 
@@ -752,7 +758,10 @@ class MCPOAuthManager:
         # configured `oauth.timeout` now bounds the callback waiter's own poll
         # loop instead — that is where the browser round-trip is awaited.
         callback_handler = _make_callback_waiter(
-            resolved_port, cfg.get("_cimd_url"), timeout=float(cfg.get("timeout", 300))
+            resolved_port,
+            cfg.get("_cimd_url"),
+            timeout=float(cfg.get("timeout", 300)),
+            issuer_aliases=authorization_response_issuer_aliases(cfg),
         )
 
         return _HERMES_PROVIDER_CLS(
@@ -764,6 +773,7 @@ class MCPOAuthManager:
             redirect_handler=redirect_handler,
             callback_handler=callback_handler,
             token_user_agent=token_request_user_agent(cfg),
+            token_headers=token_request_headers_from_env(cfg),
             **cimd_provider_kwargs(cfg),
         )
 
