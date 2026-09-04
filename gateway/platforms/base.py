@@ -5606,6 +5606,10 @@ class BasePlatformAdapter(ABC):
         ``Runner.close`` after the test body has already PASSED (root-nypt.9.1).
         """
         self._typing_paused.add(chat_id)
+        # Track outer CancelledError separately from child TimeoutError so
+        # shutdown/turn cancellation is not swallowed as "successful" cleanup
+        # (Gate3 Major on root-nypt.9.1 r1 / 88c1c5b).
+        outer_cancel: BaseException | None = None
         try:
             if stop_event is not None and not stop_event.is_set():
                 stop_event.set()
@@ -5616,20 +5620,54 @@ class BasePlatformAdapter(ABC):
                     # typing task remains cancelled from above. Shielding would
                     # preserve a non-joinable task across Runner.close.
                     await asyncio.wait_for(typing_task, timeout=timeout)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    # The task is cancelled; don't let a slow adapter-specific
-                    # cleanup block response delivery or shutdown.
+                except asyncio.TimeoutError:
+                    # Bounded join gave up; child was already cancelled above.
                     pass
+                except asyncio.CancelledError as exc:
+                    # Awaiting a cancelled child also raises CancelledError.
+                    # Only treat this as *outer* cancellation when our own
+                    # task is being cancelled (Task.cancelling() > 0 on 3.11+).
+                    me = asyncio.current_task()
+                    if me is not None and getattr(me, "cancelling", lambda: 0)() > 0:
+                        outer_cancel = exc
+                        if not typing_task.done():
+                            typing_task.cancel()
+                            try:
+                                await asyncio.wait(
+                                    {typing_task}, timeout=timeout
+                                )
+                            except asyncio.CancelledError as nested:
+                                if getattr(me, "cancelling", lambda: 0)() > 0:
+                                    outer_cancel = nested
+                            except Exception:
+                                pass
+                    # else: child finished via cancel — normal successful join
+            if outer_cancel is not None:
+                raise outer_cancel
             if not hasattr(self, "stop_typing"):
                 return
             attempts = max(1, stop_attempts)
             for attempt in range(attempts):
                 try:
                     await self._stop_typing_with_metadata(chat_id, metadata)
+                except asyncio.CancelledError as exc:
+                    me = asyncio.current_task()
+                    if me is not None and getattr(me, "cancelling", lambda: 0)() > 0:
+                        outer_cancel = exc
+                        break
+                    # Non-outer CancelledError from platform stop — ignore
                 except Exception:
                     pass
                 if attempt < attempts - 1:
-                    await asyncio.sleep(0)
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError as exc:
+                        me = asyncio.current_task()
+                        if me is not None and getattr(me, "cancelling", lambda: 0)() > 0:
+                            outer_cancel = exc
+                            break
+            if outer_cancel is not None:
+                raise outer_cancel
         finally:
             self._typing_paused.discard(chat_id)
 

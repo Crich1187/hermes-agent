@@ -121,6 +121,99 @@ async def test_stop_typing_refresh_sets_stop_event_and_joins():
     assert task.done()
 
 
+async def _cancellation_resistant_child(stop_event: asyncio.Event) -> None:
+    """Ignores CancelledError until stop_event; then delays so outer can cancel mid-join."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(0.02)
+        except asyncio.CancelledError:
+            continue
+    # Cooperative stop acknowledged — brief tail so wait_for is still in flight
+    # when the outer cleanup task is cancelled (Gate3 sabotage timing).
+    try:
+        await asyncio.sleep(0.35)
+    except asyncio.CancelledError:
+        return
+
+
+async def _resist_until_stop(stop_event: asyncio.Event) -> None:
+    """Ignores CancelledError until stop_event (no post-stop delay)."""
+    while not stop_event.is_set():
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            continue
+
+
+async def _legacy_shielded_stop(
+    typing_task: asyncio.Task,
+    *,
+    timeout: float = 0.2,
+    stop_event: asyncio.Event | None = None,
+) -> None:
+    """Pre-fix / anti-pattern: wait_for(shield(...)) leaves child pending."""
+    if stop_event is not None and not stop_event.is_set():
+        stop_event.set()
+    if typing_task is not None and not typing_task.done():
+        typing_task.cancel()
+        try:
+            await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            pass
+
+
+@pytest.mark.asyncio
+async def test_stop_typing_refresh_propagates_outer_cancel_after_joining_child():
+    """Gate3 Major: outer CancelledError must propagate; child must still join."""
+    adapter = _Adapter()
+    stop = asyncio.Event()
+    child = asyncio.create_task(_cancellation_resistant_child(stop))
+    await asyncio.sleep(0)
+
+    outer = asyncio.create_task(
+        adapter._stop_typing_refresh("1", child, timeout=1.0, stop_event=stop)
+    )
+    # Let helper set stop_event, cancel child, and enter wait_for during the
+    # child's post-stop delay window.
+    for _ in range(50):
+        if stop.is_set():
+            break
+        await asyncio.sleep(0.01)
+    assert stop.is_set()
+    await asyncio.sleep(0.05)
+    assert not outer.done(), "outer must still be joining when we cancel it"
+    outer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await outer
+
+    assert child.done(), "child must be joined even when outer cleanup is cancelled"
+
+
+@pytest.mark.asyncio
+async def test_legacy_shield_leaves_child_pending_new_path_joins():
+    """Right-reason sabotage: shielded join pends; fixed helper joins."""
+    stop_old = asyncio.Event()
+    child_old = asyncio.create_task(_resist_until_stop(stop_old))
+    await asyncio.sleep(0)
+    # Intentionally omit stop_event so shield+timeout cannot cooperatively end child.
+    await _legacy_shielded_stop(child_old, timeout=0.05, stop_event=None)
+    assert not child_old.done(), "legacy shield path must leave resistant child pending"
+    stop_old.set()
+    child_old.cancel()
+    await asyncio.wait_for(child_old, timeout=1.0)
+    assert child_old.done()
+
+    adapter = _Adapter()
+    stop_new = asyncio.Event()
+    child_new = asyncio.create_task(_cancellation_resistant_child(stop_new))
+    await asyncio.sleep(0)
+    await adapter._stop_typing_refresh(
+        "1", child_new, timeout=1.0, stop_event=stop_new
+    )
+    assert stop_new.is_set()
+    assert child_new.done(), "fixed path must join the resistant child"
+
+
 @pytest.mark.parametrize(
     "nodeid",
     [
