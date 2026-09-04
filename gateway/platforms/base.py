@@ -5594,14 +5594,28 @@ class BasePlatformAdapter(ABC):
         metadata=None,
         timeout: float = 0.5,
         stop_attempts: int = 2,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
-        """Stop the refresh task and platform typing state as one operation."""
+        """Stop the refresh task and platform typing state as one operation.
+
+        ``stop_event`` (when provided) is set before cancel so waiters such as
+        test stubs and cooperative ``_keep_typing`` loops wake without relying
+        solely on task cancellation. Do **not** ``asyncio.shield`` the typing
+        task here: a shielded await lets ``wait_for`` time out while leaving a
+        still-running typing task on the loop, which hangs pytest-asyncio's
+        ``Runner.close`` after the test body has already PASSED (root-nypt.9.1).
+        """
         self._typing_paused.add(chat_id)
         try:
+            if stop_event is not None and not stop_event.is_set():
+                stop_event.set()
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
                 try:
-                    await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+                    # Unshielded: on timeout wait_for cancels its wait and the
+                    # typing task remains cancelled from above. Shielding would
+                    # preserve a non-joinable task across Runner.close.
+                    await asyncio.wait_for(typing_task, timeout=timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     # The task is cancelled; don't let a slow adapter-specific
                     # cleanup block response delivery or shutdown.
@@ -6663,10 +6677,13 @@ class BasePlatformAdapter(ABC):
             )
 
         async def _stop_typing_task() -> None:
+            # Wake cooperative stop_event waiters (including test stubs) before
+            # cancel so typing cannot outlive the turn and block Runner.close.
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
                 metadata=_thread_metadata,
+                stop_event=interrupt_event,
             )
         
         try:

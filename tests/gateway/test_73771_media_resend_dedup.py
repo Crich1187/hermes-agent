@@ -110,10 +110,19 @@ def _make_event(platform: Platform = Platform.DISCORD) -> MessageEvent:
 
 
 async def _hold_typing(_chat_id, interval=2.0, metadata=None, stop_event=None):
-    if stop_event is not None:
-        await stop_event.wait()
-    else:
-        await asyncio.Event().wait()
+    """Cooperative typing stub for delivery tests.
+
+    Prefer ``stop_event`` (set by ``_stop_typing_refresh``) over an uncancellable
+    bare ``Event.wait()`` so pytest-asyncio can close the loop after PASSED
+    (root-nypt.9.1). Cancellation still unwinds immediately.
+    """
+    try:
+        if stop_event is not None:
+            await stop_event.wait()
+        else:
+            await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        raise
 
 
 def _allowed_file(tmp_path, monkeypatch, name: str):
