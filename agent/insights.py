@@ -20,7 +20,7 @@ import json
 import time
 from collections import Counter, defaultdict
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from agent.usage_pricing import (
     CanonicalUsage,
@@ -31,6 +31,18 @@ from agent.usage_pricing import (
 )
 
 _DEFAULT_PRICING = DEFAULT_PRICING
+
+
+def _fmt_est_cost(est_cost: float) -> str:
+    """Format an aggregate estimated cost for insights status columns.
+
+    Sub-cent aggregates use 4dp so they do not collapse to "~$0.00".
+    """
+    if est_cost == 0:
+        return "~$0.00"
+    if abs(est_cost) < 0.01:
+        return f"~${est_cost:.4f}"
+    return f"~${est_cost:.2f}"
 
 
 def _has_known_pricing(model_name: str, provider: str = None, base_url: str = None) -> bool:
@@ -90,6 +102,76 @@ def _bar_chart(values: List[int], max_width: int = 20) -> List[str]:
     return ["█" * max(1, int(v / peak * max_width)) if v > 0 else "" for v in values]
 
 
+# Providers Pepper-/insights AC requires explicit attribution for (root-e4k).
+# Always emit a row for each so "no sessions in window" is visible as missing
+# data rather than collapsing into a silent $0 line.
+REQUIRED_INSIGHT_PROVIDERS: tuple[str, ...] = (
+    "nous",
+    "zai",
+    "alibaba",
+    "anthropic",
+)
+
+
+def canonicalize_billing_provider(
+    provider: Optional[str],
+    base_url: Optional[str] = None,
+) -> str:
+    """Map stored billing_provider / base_url to a stable attribution key.
+
+    Aliases (non-exhaustive):
+      - ``alibaba-coding-plan`` / dashscope hosts → ``alibaba``
+      - z.ai / bigmodel hosts → ``zai``
+      - nousresearch inference hosts → ``nous``
+      - empty / unrecognized → ``unknown`` (missing attribution, not zero spend)
+    """
+    raw = (provider or "").strip().lower()
+    url = (base_url or "").strip().lower()
+
+    if raw in {"alibaba", "alibaba-coding-plan", "alibaba_coding", "dashscope"}:
+        return "alibaba"
+    if "dashscope" in url or "aliyuncs.com" in url or "coding-intl.dashscope" in url:
+        return "alibaba"
+
+    if raw in {"zai", "z.ai", "zhipu", "bigmodel"}:
+        return "zai"
+    if "z.ai" in url or "bigmodel.cn" in url or "api.z.ai" in url:
+        return "zai"
+
+    if raw in {"anthropic", "claude"}:
+        return "anthropic"
+    if "api.anthropic.com" in url or "anthropic.com" in url:
+        return "anthropic"
+
+    if raw in {"nous", "nousresearch", "nous-research"}:
+        return "nous"
+    if "nousresearch.com" in url or "inference-api.nousresearch.com" in url:
+        return "nous"
+
+    if raw:
+        return raw
+    return "unknown"
+
+
+def _provider_spend_status(
+    *,
+    sessions: int,
+    estimated_cost: float,
+    included_sessions: int,
+    unknown_sessions: int,
+) -> str:
+    """Classify provider spend for AC: missing data vs zero spend vs priced."""
+    if sessions <= 0:
+        return "missing"  # no attributed sessions in the window
+    if estimated_cost > 0:
+        return "spend"
+    if included_sessions > 0 and unknown_sessions == 0:
+        return "zero_spend"  # subscription/included — sessions exist, $0 invoice
+    if unknown_sessions == sessions:
+        return "unknown_pricing"  # sessions exist but no price table
+    return "zero_spend"
+
+
 class InsightsEngine:
     """
     Analyzes session history and produces usage insights.
@@ -134,6 +216,7 @@ class InsightsEngine:
                 "empty": True,
                 "overview": {},
                 "models": [],
+                "providers": self._compute_provider_breakdown([]),
                 "platforms": [],
                 "tools": [],
                 "skills": {
@@ -152,6 +235,7 @@ class InsightsEngine:
         # Compute insights
         overview = self._compute_overview(sessions, message_stats)
         models = self._compute_model_breakdown(sessions)
+        providers = self._compute_provider_breakdown(sessions)
         platforms = self._compute_platform_breakdown(sessions)
         tools = self._compute_tool_breakdown(tool_usage)
         skills = self._compute_skill_breakdown(skill_usage)
@@ -165,6 +249,7 @@ class InsightsEngine:
             "generated_at": time.time(),
             "overview": overview,
             "models": models,
+            "providers": providers,
             "platforms": platforms,
             "tools": tools,
             "skills": skills,
@@ -550,6 +635,81 @@ class InsightsEngine:
         result.sort(key=lambda x: x["sessions"], reverse=True)
         return result
 
+    def _compute_provider_breakdown(self, sessions: List[Dict]) -> List[Dict]:
+        """Break down usage by canonical billing provider (root-e4k).
+
+        Always includes REQUIRED_INSIGHT_PROVIDERS so missing attribution is
+        explicit (``status=missing``) rather than looking like $0 spend.
+        """
+        provider_data: Dict[str, Dict[str, Any]] = defaultdict(
+            lambda: {
+                "sessions": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_read_tokens": 0,
+                "cache_write_tokens": 0,
+                "total_tokens": 0,
+                "estimated_cost": 0.0,
+                "included_sessions": 0,
+                "unknown_sessions": 0,
+            }
+        )
+
+        for s in sessions:
+            key = canonicalize_billing_provider(
+                s.get("billing_provider"), s.get("billing_base_url")
+            )
+            d = provider_data[key]
+            d["sessions"] += 1
+            inp = s.get("input_tokens") or 0
+            out = s.get("output_tokens") or 0
+            cache_read = s.get("cache_read_tokens") or 0
+            cache_write = s.get("cache_write_tokens") or 0
+            d["input_tokens"] += inp
+            d["output_tokens"] += out
+            d["cache_read_tokens"] += cache_read
+            d["cache_write_tokens"] += cache_write
+            d["total_tokens"] += inp + out + cache_read + cache_write
+            estimate, status = _estimate_cost(s)
+            d["estimated_cost"] += estimate
+            if status == "included":
+                d["included_sessions"] += 1
+            elif status == "unknown":
+                d["unknown_sessions"] += 1
+
+        # Ensure required providers always appear.
+        for required in REQUIRED_INSIGHT_PROVIDERS:
+            provider_data[required]  # materialize default row
+
+        result: List[Dict[str, Any]] = []
+        for provider, data in provider_data.items():
+            status = _provider_spend_status(
+                sessions=data["sessions"],
+                estimated_cost=data["estimated_cost"],
+                included_sessions=data["included_sessions"],
+                unknown_sessions=data["unknown_sessions"],
+            )
+            result.append(
+                {
+                    "provider": provider,
+                    "required": provider in REQUIRED_INSIGHT_PROVIDERS,
+                    "status": status,
+                    **data,
+                }
+            )
+
+        # Required providers first (fixed order), then others by tokens/sessions.
+        required_rank = {name: i for i, name in enumerate(REQUIRED_INSIGHT_PROVIDERS)}
+
+        def _sort_key(row: Dict[str, Any]) -> tuple:
+            name = row["provider"]
+            if name in required_rank:
+                return (0, required_rank[name], 0, 0)
+            return (1, 0, -row["total_tokens"], -row["sessions"])
+
+        result.sort(key=_sort_key)
+        return result
+
     def _compute_tool_breakdown(self, tool_usage: List[Dict]) -> List[Dict]:
         """Process tool usage data into a ranked list with percentages."""
         total_calls = sum(t["count"] for t in tool_usage) if tool_usage else 0
@@ -768,6 +928,66 @@ class InsightsEngine:
         lines.append(f"  Avg msgs/session:  {o['avg_messages_per_session']:.1f}")
         lines.append("")
 
+        # Cost breakdown — surface the three buckets so subscription-included
+        # and unknown-cost sessions are visible instead of silently collapsing
+        # to $0. See #77223.
+        est_cost = o.get("estimated_cost", 0.0)
+        included_sessions = o.get("included_cost_sessions", 0)
+        unknown_sessions = o.get("unknown_cost_sessions", 0)
+        if est_cost > 0 or included_sessions > 0 or unknown_sessions > 0:
+            lines.append("  💰 Cost")
+            lines.append("  " + "─" * 56)
+            if est_cost > 0:
+                lines.append(f"  Estimated:          {_fmt_est_cost(est_cost)}")
+            if included_sessions > 0:
+                lines.append(
+                    f"  Included:           {included_sessions} session(s) "
+                    f"(subscription — no provider invoice)"
+                )
+            if unknown_sessions > 0:
+                lines.append(
+                    f"  Unknown:            {unknown_sessions} session(s) "
+                    f"(no pricing data)"
+                )
+            lines.append("")
+
+        # Provider attribution (root-e4k) — always show required providers.
+        providers = report.get("providers") or []
+        if providers:
+            lines.append("  🏷️  Providers")
+            lines.append("  " + "─" * 56)
+            lines.append(
+                f"  {'Provider':<14} {'Sessions':>8} {'Tokens':>12} {'Status':>16}"
+            )
+            for p in providers:
+                status = p.get("status") or "missing"
+                if status == "missing":
+                    status_label = "no data"
+                elif status == "zero_spend":
+                    status_label = "zero spend"
+                elif status == "unknown_pricing":
+                    status_label = "unknown $"
+                elif status == "spend":
+                    status_label = _fmt_est_cost(p.get("estimated_cost") or 0.0)
+                else:
+                    status_label = status
+                # Skip non-required unknown/custom noise unless it has sessions
+                if (
+                    not p.get("required")
+                    and (p.get("sessions") or 0) == 0
+                    and p.get("provider") not in REQUIRED_INSIGHT_PROVIDERS
+                ):
+                    continue
+                lines.append(
+                    f"  {p['provider']:<14} {p.get('sessions', 0):>8} "
+                    f"{p.get('total_tokens', 0):>12,} {status_label:>16}"
+                )
+            lines.append(
+                "  Status: 'no data' = no attributed sessions in window; "
+                "'zero spend' = sessions with $0 invoiceable estimate."
+            )
+            lines.append("")
+
         # Model breakdown
         if report["models"]:
             lines.append("  🤖 Models Used")
@@ -881,6 +1101,44 @@ class InsightsEngine:
         if o["total_hours"] > 0:
             lines.append(f"**Active time:** ~{_format_duration(o['total_hours'] * 3600)} | **Avg session:** ~{_format_duration(o['avg_session_duration'])}")
         lines.append("")
+
+        # Cost breakdown — surface buckets so included/unknown are visible
+        est_cost = o.get("estimated_cost", 0.0)
+        included = o.get("included_cost_sessions", 0)
+        unknown = o.get("unknown_cost_sessions", 0)
+        cost_parts: list[str] = []
+        if est_cost > 0:
+            cost_parts.append(f"{_fmt_est_cost(est_cost)} estimated")
+        if included > 0:
+            cost_parts.append(f"{included} included (subscription)")
+        if unknown > 0:
+            cost_parts.append(f"{unknown} unknown")
+        if cost_parts:
+            lines.append(f"**Cost:** {' | '.join(cost_parts)}")
+            lines.append("")
+
+        providers = report.get("providers") or []
+        if providers:
+            lines.append("**🏷️ Providers:**")
+            for p in providers:
+                if not p.get("required") and (p.get("sessions") or 0) == 0:
+                    continue
+                status = p.get("status") or "missing"
+                if status == "missing":
+                    detail = "no data"
+                elif status == "zero_spend":
+                    detail = "zero spend"
+                elif status == "unknown_pricing":
+                    detail = "unknown pricing"
+                elif status == "spend":
+                    detail = _fmt_est_cost(p.get("estimated_cost") or 0.0)
+                else:
+                    detail = status
+                lines.append(
+                    f"  {p['provider']} — {p.get('sessions', 0)} sessions, "
+                    f"{p.get('total_tokens', 0):,} tokens, {detail}"
+                )
+            lines.append("")
 
         # Models (top 5)
         if report["models"]:
