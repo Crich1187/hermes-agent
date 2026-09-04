@@ -642,3 +642,87 @@ class TestAdapterInit:
         assert asyncio.run(ad.get_chat_info("U123"))["type"] == "dm"
         assert asyncio.run(ad.get_chat_info("C123"))["type"] == "group"
         assert asyncio.run(ad.get_chat_info("R123"))["type"] == "channel"
+
+
+# ---------------------------------------------------------------------------
+# Identity lock (root-r0i04)
+# ---------------------------------------------------------------------------
+
+
+class _StrictLockResult(tuple):
+    """A (bool, dict|None) result that refuses to be truth-tested.
+
+    acquire_scoped_lock returns a 2-tuple. Code that writes
+    ``if not acquire_scoped_lock(...)`` truth-tests the tuple — always truthy —
+    instead of unpacking it, which silently disables the guard. Returning this
+    from the fake turns that mistake into a hard failure: any ``bool()`` on the
+    result raises. A plain tuple cannot catch it, and a bare-bool fake actively
+    hides it.
+    """
+
+    def __bool__(self):  # pragma: no cover - raising IS the assertion
+        raise AssertionError(
+            "acquire_scoped_lock() result was truth-tested instead of unpacked"
+        )
+
+
+class TestLineIdentityLock:
+    """The lock guard must fire, and must be reached by unpacking (root-r0i04)."""
+
+    def _adapter(self):
+        from gateway.config import PlatformConfig
+        return LineAdapter(PlatformConfig(
+            enabled=True,
+            extra={"channel_access_token": "tok-abc", "channel_secret": "sec-xyz"},
+        ))
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_channel_held_by_another_profile(self, monkeypatch):
+        """Fake returns REAL tuple shape (False, existing); connect must fail
+        and must not retain the lock key.
+        """
+        import gateway.status as gateway_status
+
+        existing = {"pid": 4242}
+
+        def _fake(scope, key, metadata=None):
+            assert scope == "line"
+            assert isinstance(key, str) and len(key) == 16
+            # Real return shape from gateway.status.acquire_scoped_lock
+            return _StrictLockResult((False, existing))
+
+        monkeypatch.setattr(gateway_status, "acquire_scoped_lock", _fake)
+        adapter = self._adapter()
+        assert await adapter.connect() is False
+        assert getattr(adapter, "_lock_key", None) is None
+        assert adapter._fatal_error_code == "lock_conflict"
+
+    @pytest.mark.asyncio
+    async def test_plain_tuple_conflict_does_not_retain_lock(self, monkeypatch):
+        """Same conflict path with a plain tuple (no __bool__ trap) — AC shape."""
+        import gateway.status as gateway_status
+
+        monkeypatch.setattr(
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda scope, key, metadata=None: (False, {"pid": 4242}),
+        )
+        adapter = self._adapter()
+        assert await adapter.connect() is False
+        assert getattr(adapter, "_lock_key", None) is None
+        assert adapter._fatal_error_code == "lock_conflict"
+
+    @pytest.mark.asyncio
+    async def test_granted_lock_is_unpacked_not_truth_tested(self, monkeypatch):
+        """Guards against a fix that 'works' only because a tuple is truthy."""
+        import gateway.status as gateway_status
+
+        monkeypatch.setattr(
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda scope, key, metadata=None: _StrictLockResult((True, None)),
+        )
+        adapter = self._adapter()
+        await adapter.connect()
+        assert adapter._lock_key is not None
+        assert adapter._fatal_error_code != "lock_conflict"

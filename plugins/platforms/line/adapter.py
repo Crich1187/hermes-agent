@@ -740,10 +740,18 @@ class LineAdapter(BasePlatformAdapter):
             from gateway.status import acquire_scoped_lock
             # Use a hash of the token so we don't write the secret to disk.
             tok_hash = hashlib.sha256(self.channel_access_token.encode()).hexdigest()[:16]
-            if not acquire_scoped_lock("line", tok_hash):
+            # acquire_scoped_lock returns tuple[bool, Optional[dict]]; a non-empty
+            # tuple is always truthy, so testing it directly made this guard
+            # unreachable and the LINE identity lock never fired. root-r0i04.
+            acquired, existing = acquire_scoped_lock(
+                "line", tok_hash, metadata={"platform": "line"}
+            )
+            if not acquired:
+                owner_pid = existing.get("pid") if isinstance(existing, dict) else None
                 self._set_fatal_error(
                     "lock_conflict",
-                    "LINE channel already in use by another profile",
+                    "LINE channel already in use by another profile"
+                    + (f" (PID {owner_pid})" if owner_pid else ""),
                     retryable=False,
                 )
                 return False
