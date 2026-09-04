@@ -5003,6 +5003,48 @@ def _record_tool_trust_metadata(
                 hints[name] = _annotation_read_only_hint(tool)
 
 
+def _refresh_trust_metadata_from_live_server(server_name: str) -> bool:
+    """Re-record trust hints from a connected server's live ``tools/list``.
+
+    Returns True when live tools were available and metadata was refreshed.
+    Used by the call-time gate so deferred (schema-cache / lazy) registration
+    cannot permanently over-gate tools that advertise ``readOnlyHint=true``
+    on the wire (root-usnyx).
+    """
+    with _lock:
+        server = _servers.get(server_name)
+        tools = list(getattr(server, "_tools", None) or []) if server else []
+        config = getattr(server, "_config", None) if server else None
+        if config is None:
+            config = (_lazy_server_configs.get(server_name) or {}).copy()
+    if not tools:
+        return False
+    _record_tool_trust_metadata(server_name, config or {}, tools)
+    return True
+
+
+def _ensure_trust_hints_before_gate(server_name: str, tool_name: str) -> None:
+    """Bring discovery-time readOnlyHint metadata up to date before gating.
+
+    Schema-cache / lazy registration may have recorded write-capable stubs
+    because older cache entries omitted ``annotations``. Live ``tools/list``
+    (and a subsequent ``_register_server_tools``) carries the real hints —
+    but the trust gate historically ran *before* the deferred spawn, so a
+    readOnlyHint=true tool was still prompted as write-capable.
+
+    Connecting an already-configured server to refresh ``tools/list`` is
+    discovery, not a write. ``tools/call`` remains behind ``_trust_gate_check``.
+    """
+    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    if trust != _TRUST_UNTRUSTED:
+        return
+    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+        return
+    # Spawn / reconnect if needed so live tools populate, then re-record.
+    _get_connected_server_for_call(server_name)
+    _refresh_trust_metadata_from_live_server(server_name)
+
+
 def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     """Consult the approval path for write-capable tools on untrusted servers.
 
@@ -6582,9 +6624,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
     def _handler(args: dict, **kwargs) -> str:
         # Trust-tier gate (security boundary): write-capable tools on
-        # servers configured ``trust: untrusted`` must be approved by the
-        # user before ANY transport work happens — including the lazy
-        # first-use spawn below. A denied call never touches the server.
+        # servers configured ``trust: untrusted`` must be approved before
+        # tools/call. Deferred discovery may have registered from a schema
+        # cache that omitted annotations — refresh live tools/list metadata
+        # first so readOnlyHint=true exemptions are not lost (root-usnyx).
+        # Connecting for discovery is not a write; tools/call stays gated.
+        _ensure_trust_hints_before_gate(server_name, tool_name)
         gate_error = _trust_gate_check(server_name, tool_name)
         if gate_error is not None:
             return gate_error

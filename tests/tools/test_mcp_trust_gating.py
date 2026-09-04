@@ -19,6 +19,7 @@ Adversarial notes encoded in these tests:
 
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -245,3 +246,142 @@ class TestAnnotationCaptureAtDiscovery:
         assert mcp_tool._annotation_read_only_hint(
             SimpleNamespace()
         ) is False
+
+
+# ---------------------------------------------------------------------------
+# Deferred discovery / annotation-loss (root-usnyx)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def trustprobe_server_py():
+    return (
+        Path(__file__).resolve().parents[1]
+        / "fixtures"
+        / "mcp_trustprobe"
+        / "server.py"
+    )
+
+
+class TestDeferredTrustHintRefresh:
+    """Schema-cache stubs must not permanently over-gate readOnlyHint=true."""
+
+    def test_cache_without_annotations_over_gates_read_before_refresh(self):
+        """Control: stale hints alone classify probe_read as write-capable."""
+        _set_trust("srv", "untrusted")
+        _set_read_only("srv", "probe_read", False)
+        assert mcp_tool._trust_gate_check("srv", "probe_read") is not None
+
+    def test_ensure_hints_refreshes_from_live_tools_list(
+        self, trustprobe_server_py
+    ):
+        """Live tools/list after deferred connect exempts annotated reads.
+
+        Mirrors the Profile-010 sandbox: tools/list advertises
+        readOnlyHint=true for probe_read while probe_write stays gated.
+        """
+        import sys
+        from tools.registry import ToolRegistry
+
+        mcp_tool._servers.clear()
+        mcp_tool._lazy_server_configs.clear()
+        mcp_tool._server_error_counts.clear()
+        mcp_tool._server_trust_levels.clear()
+        mcp_tool._tool_read_only_hints.clear()
+
+        # Stale cache registration (annotations omitted) — the deferred path.
+        cache_tools = [
+            {
+                "name": "probe_read",
+                "description": "r",
+                "inputSchema": {"type": "object"},
+            },
+            {
+                "name": "probe_write",
+                "description": "w",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {"value": {"type": "string"}},
+                },
+            },
+        ]
+        config = {
+            "command": sys.executable,
+            "args": [str(trustprobe_server_py)],
+            "trust": "untrusted",
+            "tools": {"resources": False, "prompts": False},
+            "lazy": True,
+            "connect_timeout": 30,
+        }
+        with patch("tools.registry.registry", ToolRegistry()), \
+             patch("tools.mcp_tool._track_mcp_tool_server"), \
+             patch(
+                 "tools.mcp_schema_cache.tools_from_cache_entry",
+                 return_value=cache_tools,
+             ), \
+             patch(
+                 "tools.mcp_schema_cache.utility_tools_from_cache_entry",
+                 return_value=[],
+             ), \
+             patch(
+                 "tools.mcp_schema_cache.config_fingerprint",
+                 return_value="usnyx-fp",
+             ):
+            mcp_tool._register_from_cache_sync("usnyxprobe", config, {})
+
+        assert mcp_tool._tool_read_only_hints["usnyxprobe"]["probe_read"] is False
+
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            read_out = mcp_tool._make_tool_handler(
+                "usnyxprobe", "probe_read", 30.0
+            )({})
+            write_out = mcp_tool._make_tool_handler(
+                "usnyxprobe", "probe_write", 30.0
+            )({"value": "z"})
+
+        assert json.loads(read_out).get("result") == "read-ok"
+        assert "error" in json.loads(write_out)
+        # Only the write tool should have consulted approval.
+        assert consent.call_count == 1
+        assert mcp_tool._tool_read_only_hints["usnyxprobe"]["probe_read"] is True
+
+        try:
+            mcp_tool.shutdown_mcp_servers()
+        except Exception:
+            pass
+
+    def test_name_mismatch_does_not_exempt_without_live_hint(self):
+        """Wrong lookup key stays fail-closed (no silent exemption)."""
+        _set_trust("srv", "untrusted")
+        _set_read_only("srv", "probe_read", True)
+        # Gate asked with a different name than recorded → write-capable.
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            err = mcp_tool._trust_gate_check("srv", "mcp__srv__probe_read")
+        assert err is not None
+        consent.assert_called_once()
+
+    def test_malformed_annotation_string_fail_closed(self):
+        assert mcp_tool._annotation_read_only_hint(
+            SimpleNamespace(annotations={"readOnlyHint": "true"})
+        ) is False
+
+    def test_explicit_false_still_gated_after_refresh_noop(self, fake_session):
+        _set_trust("srv", "untrusted")
+        _set_read_only("srv", "probe_write", False)
+        handler = mcp_tool._make_tool_handler("srv", "probe_write", 30.0)
+        with patch(
+            "tools.mcp_tool._get_connected_server_for_call",
+            return_value=None,
+        ), patch(
+            "tools.approval.request_elicitation_consent",
+            return_value="decline",
+        ) as consent:
+            raw = handler({"value": "x"})
+        consent.assert_called_once()
+        assert "error" in json.loads(raw)
