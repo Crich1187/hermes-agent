@@ -2572,6 +2572,23 @@ class BuzzAdapter(BasePlatformAdapter):
         description = str(meta.get("description") or "").strip()
         return name == "DM" and not description
 
+    def _has_recipient_p_tags(self, event: dict) -> bool:
+        """True when *event* carries any recipient ``p`` tag entries.
+
+        Presence is independent of whether the tag values parse as valid
+        64-hex pubkeys — callers that need parseable recipients use
+        ``_recipient_p_pubkeys``. Distinguishing "no p tags" from
+        "p tags present but unparseable" keeps malformed addressing from
+        silently falling back to display-name text matching.
+        """
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return False
+        for tag in tags:
+            if isinstance(tag, (list, tuple)) and len(tag) >= 1 and tag[0] == "p":
+                return True
+        return False
+
     def _recipient_p_pubkeys(self, event: dict) -> set[str]:
         """Hex pubkeys from signed ``p`` tags on *event* (recipient addressing)."""
         tags = event.get("tags")
@@ -2648,14 +2665,16 @@ class BuzzAdapter(BasePlatformAdapter):
         When the event carries one or more recipient ``p`` tags, those tags
         alone decide addressing: display-name / text mentions must not wake
         this agent for a different pubkey (same short name, different host —
-        e.g. Pepper Athena vs CMR Athena). With no recipient ``p`` tags,
-        fall back to text / npub / hex mention matching.
+        e.g. Pepper Athena vs CMR Athena). If ``p`` tags are present but none
+        parse as a valid 64-hex recipient, fail closed (do not fall back to
+        text). With no recipient ``p`` tags at all, fall back to text / npub
+        / hex mention matching.
         """
         content = event.get("content")
         if not isinstance(content, str):
             return False
-        recipients = self._recipient_p_pubkeys(event)
-        if recipients:
+        if self._has_recipient_p_tags(event):
+            recipients = self._recipient_p_pubkeys(event)
             return bool(self._self_pubkey) and self._self_pubkey in recipients
         return self._is_mentioned(content)
 

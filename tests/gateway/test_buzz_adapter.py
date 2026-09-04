@@ -1651,6 +1651,93 @@ class TestMentionGating:
         assert len(adapter._dispatched) == 1
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_p",
+        [
+            "47f74dad",  # truncated foreign hex (root-jryjt Gate3 repro)
+            SELF_NPUB,  # bech32 npub is not a valid p-tag recipient
+            "",  # empty string value
+            "not-a-real-pubkey",
+        ],
+    )
+    async def test_malformed_only_p_tag_fails_closed_despite_display_name(
+        self, adapter, bad_p
+    ):
+        """root-jryjt Gate3: present-but-unparseable p tags must not text-fallback."""
+        adapter._display_name = "Athena"
+        event = _event(
+            "e1",
+            content="@Athena (cmr) reply with exactly: PONG-jryjt-hermes",
+            created_at=10,
+        )
+        event["tags"].append(["p", bad_p])
+        assert adapter._has_recipient_p_tags(event) is True
+        assert adapter._recipient_p_pubkeys(event) == set()
+        assert adapter._is_addressed(event) is False
+        await self._poll_with(adapter, event)
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_empty_p_tag_entry_fails_closed_despite_display_name(self, adapter):
+        """A bare ``[\"p\"]`` tag (no value) is still a present recipient tag."""
+        adapter._display_name = "Athena"
+        event = _event(
+            "e1",
+            content="@Athena (cmr) reply with exactly: PONG-jryjt-hermes",
+            created_at=10,
+        )
+        event["tags"].append(["p"])
+        assert adapter._has_recipient_p_tags(event) is True
+        assert adapter._recipient_p_pubkeys(event) == set()
+        assert adapter._is_addressed(event) is False
+        await self._poll_with(adapter, event)
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_valid_self_among_malformed_p_tags_still_dispatches(self, adapter):
+        adapter._display_name = "Athena"
+        event = _event(
+            "e1",
+            content="@Athena please acknowledge",
+            created_at=10,
+        )
+        event["tags"].extend(
+            [
+                ["p", "47f74dad"],
+                ["p", SELF_NPUB],
+                ["p", ""],
+                ["p", SELF_PUBKEY],
+                ["p", "not-a-real-pubkey"],
+            ]
+        )
+        assert adapter._is_addressed(event) is True
+        await self._poll_with(adapter, event)
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
+    async def test_valid_foreign_plus_malformed_rejects_despite_display_name(
+        self, adapter
+    ):
+        adapter._display_name = "Athena"
+        cmr_athena = "47f74dad" + ("a" * 56)
+        event = _event(
+            "e1",
+            content="@Athena (cmr) reply with exactly: PONG-jryjt-hermes",
+            created_at=10,
+        )
+        event["tags"].extend(
+            [
+                ["p", "47f74dad"],
+                ["p", SELF_NPUB],
+                ["p", cmr_athena],
+                ["p", ""],
+            ]
+        )
+        assert adapter._is_addressed(event) is False
+        await self._poll_with(adapter, event)
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
     async def test_require_mention_false_still_dispatches_unaddressed_message(self, adapter):
         adapter.require_mention = False
         await self._poll_with(adapter, _event("e1", content="just chatting", created_at=10))
