@@ -1843,6 +1843,30 @@ class BasePlatformAdapter(ABC):
         """
         pass
 
+    async def _stop_typing_with_metadata(self, chat_id: str, metadata=None) -> None:
+        """Stop typing while preserving platform-specific routing metadata.
+
+        Most adapters key typing state by chat and retain the historical
+        ``stop_typing(chat_id)`` signature. Slack AI status is per thread and
+        workspace, however, so losing metadata can clear a sibling thread or
+        leave the current one active. Introspect at this shared chokepoint so
+        existing adapters remain source-compatible.
+        """
+        if metadata:
+            try:
+                params = inspect.signature(self.stop_typing).parameters
+                accepts_metadata = "metadata" in params or any(
+                    param.kind is inspect.Parameter.VAR_KEYWORD
+                    for param in params.values()
+                )
+            except (TypeError, ValueError):
+                accepts_metadata = False
+            if accepts_metadata:
+                stop_typing = getattr(self, "stop_typing")
+                await stop_typing(chat_id, metadata=metadata)
+                return
+        await self.stop_typing(chat_id)
+
     async def send_multiple_images(
         self,
         chat_id: str,
@@ -2305,6 +2329,101 @@ class BasePlatformAdapter(ABC):
     def resume_typing_for_chat(self, chat_id: str) -> None:
         """Resume typing indicator for a chat after approval resolves."""
         self._typing_paused.discard(chat_id)
+
+    async def _stop_typing_refresh(
+        self,
+        chat_id: str,
+        typing_task: asyncio.Task | None = None,
+        *,
+        metadata=None,
+        timeout: float = 0.5,
+        stop_attempts: int = 2,
+        stop_event: asyncio.Event | None = None,
+    ) -> None:
+        """Stop the refresh task and platform typing state as one operation.
+
+        ``stop_event`` (when provided) is set before cancel so waiters such as
+        test stubs and cooperative ``_keep_typing`` loops wake without relying
+        solely on task cancellation.
+
+        Do **not** ``asyncio.shield`` the typing task here: a shielded await
+        lets ``wait_for`` time out while leaving a still-running typing task
+        on the loop, which hangs pytest-asyncio's ``Runner.close`` after the
+        test body has already PASSED (root-nypt.9.1).
+
+        Critical lifecycle rule: ``stop_event`` must be a *typing-only* Event,
+        never the session ``interrupt_event``. Setting the shared interrupt
+        during typing cleanup (including the ``finally`` after an in-band
+        pending-drain handoff) left the next drain turn starting with
+        interrupt already set and broke the one-worker pending-drain
+        ownership/observability contract (Gate3 FAIL on fb1c026).
+
+        Outer ``CancelledError`` (cleanup/shutdown) is distinguished from the
+        CancelledError raised when awaiting an already-cancelled child via
+        ``Task.cancelling()``; after a bounded unshielded join, outer cancel
+        is re-raised so turn teardown is not swallowed.
+        """
+        self._typing_paused.add(chat_id)
+        outer_cancel: BaseException | None = None
+        try:
+            if stop_event is not None and not stop_event.is_set():
+                stop_event.set()
+            if typing_task is not None and not typing_task.done():
+                typing_task.cancel()
+                try:
+                    # Unshielded: on timeout wait_for cancels its wait and the
+                    # typing task remains cancelled from above. Shielding would
+                    # preserve a non-joinable task across Runner.close.
+                    await asyncio.wait_for(typing_task, timeout=timeout)
+                except asyncio.TimeoutError:
+                    # Bounded join gave up; child was already cancelled above.
+                    pass
+                except asyncio.CancelledError as exc:
+                    # Awaiting a cancelled child also raises CancelledError.
+                    # Only treat this as *outer* cancellation when our own
+                    # task is being cancelled (Task.cancelling() > 0).
+                    me = asyncio.current_task()
+                    if me is not None and me.cancelling() > 0:
+                        outer_cancel = exc
+                        if not typing_task.done():
+                            typing_task.cancel()
+                            try:
+                                await asyncio.wait(
+                                    {typing_task}, timeout=timeout
+                                )
+                            except asyncio.CancelledError as nested:
+                                if me.cancelling() > 0:
+                                    outer_cancel = nested
+                            except Exception:
+                                pass
+                    # else: child finished via cancel — normal successful join
+            if outer_cancel is not None:
+                raise outer_cancel
+            if not hasattr(self, "stop_typing"):
+                return
+            attempts = max(1, stop_attempts)
+            for attempt in range(attempts):
+                try:
+                    await self._stop_typing_with_metadata(chat_id, metadata)
+                except asyncio.CancelledError as exc:
+                    me = asyncio.current_task()
+                    if me is not None and me.cancelling() > 0:
+                        outer_cancel = exc
+                        break
+                except Exception:
+                    pass
+                if attempt < attempts - 1:
+                    try:
+                        await asyncio.sleep(0)
+                    except asyncio.CancelledError as exc:
+                        me = asyncio.current_task()
+                        if me is not None and me.cancelling() > 0:
+                            outer_cancel = exc
+                            break
+            if outer_cancel is not None:
+                raise outer_cancel
+        finally:
+            self._typing_paused.discard(chat_id)
 
     async def interrupt_session_activity(self, session_key: str, chat_id: str) -> None:
         """Signal the active session loop to stop and clear typing immediately."""
@@ -3040,15 +3159,30 @@ class BasePlatformAdapter(ABC):
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
         
-        # Start continuous typing indicator (refreshes every 2 seconds)
+        # Start continuous typing indicator (refreshes every 2 seconds).
+        # Use a typing-only stop Event for cooperative wake; OR it with the
+        # session interrupt so inbound interrupts still end the typing loop.
+        # Never pass interrupt_event alone into _stop_typing_refresh — setting
+        # that shared Event during cleanup poisons the next pending-drain turn.
         _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+        typing_stop = asyncio.Event()
+
+        class _AnySetEvent:
+            __slots__ = ("_events",)
+
+            def __init__(self, *events: asyncio.Event) -> None:
+                self._events = events
+
+            def is_set(self) -> bool:
+                return any(ev.is_set() for ev in self._events)
+
         _keep_typing_kwargs = {"metadata": _thread_metadata}
         try:
             _keep_typing_sig = inspect.signature(self._keep_typing)
         except (TypeError, ValueError):
             _keep_typing_sig = None
         if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
-            _keep_typing_kwargs["stop_event"] = interrupt_event
+            _keep_typing_kwargs["stop_event"] = _AnySetEvent(typing_stop, interrupt_event)
         typing_task = asyncio.create_task(
             self._keep_typing(
                 event.source.chat_id,
@@ -3057,15 +3191,14 @@ class BasePlatformAdapter(ABC):
         )
 
         async def _stop_typing_task() -> None:
-            typing_task.cancel()
-            try:
-                await asyncio.wait_for(asyncio.shield(typing_task), timeout=0.5)
-            except (asyncio.CancelledError, asyncio.TimeoutError):
-                # Cancellation cleanup must not block adapter shutdown.  The
-                # typing task is already cancelled; if the parent task is also
-                # cancelling, let this message-processing task unwind now.
-                pass
-        
+            await self._stop_typing_refresh(
+                event.source.chat_id,
+                typing_task,
+                metadata=_thread_metadata,
+                timeout=0.5,
+                stop_event=typing_stop,
+            )
+
         try:
             await self._run_processing_hook("on_processing_start", event)
 

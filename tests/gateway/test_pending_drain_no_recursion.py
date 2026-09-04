@@ -103,6 +103,10 @@ async def test_in_band_drain_does_not_grow_stack():
     depths: list[int] = []
     next_index = [1]
     final_handler_returned = asyncio.Event()
+    # Capture the owning task at final-handler signal time. Looking up
+    # ``_session_tasks`` *after* wait() alone is racy once typing cleanup is
+    # unshielded (finally can release ownership before the waiter resumes).
+    terminal_at_signal: list[asyncio.Task | None] = []
 
     async def handler(event):
         depths.append(_count_pmb_frames())
@@ -111,6 +115,7 @@ async def test_in_band_drain_does_not_grow_stack():
             next_index[0] += 1
         await asyncio.sleep(per_turn_delay)
         if len(depths) == N:
+            terminal_at_signal.append(adapter._session_tasks.get(sk))
             final_handler_returned.set()
         return "ok"
 
@@ -124,8 +129,10 @@ async def test_in_band_drain_does_not_grow_stack():
     # for the final handler instead, then await its registered task.  A task
     # only completes after its finally block releases the session guard.
     await asyncio.wait_for(final_handler_returned.wait(), timeout=N * per_turn_delay + 5)
-    terminal_task = adapter._session_tasks.get(sk)
+    terminal_task = terminal_at_signal[0] if terminal_at_signal else None
     assert terminal_task is not None, "final pending-drain task was not registered"
+    # Task identity captured at signal is the observability contract; map entry
+    # may already be cleared once the terminal finally finishes after signal.
     await asyncio.wait_for(terminal_task, timeout=5)
 
     await adapter.cancel_background_tasks()
@@ -137,6 +144,48 @@ async def test_in_band_drain_does_not_grow_stack():
     assert max_depth <= 2, (
         f"in-band drain is recursing instead of spawning a fresh task — "
         f"stack depth grew with chain length: {depths!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_in_band_drain_typing_stop_does_not_set_session_interrupt():
+    """Typing cleanup must not set the shared session interrupt Event.
+
+    Gate3 FAIL on fb1c026: ``_stop_typing_refresh(..., stop_event=interrupt_event)``
+    ran from the previous turn's ``finally`` after handoff and left the next
+    drain turn starting with interrupt already set.  Probe interrupt at every
+    handler entry across a short chain — must stay clear.
+    """
+    adapter = _make_adapter()
+    sk = _sk()
+    N = 4
+    interrupt_at_entry: list[bool] = []
+    next_index = [1]
+    done = asyncio.Event()
+
+    async def handler(event):
+        guard = adapter._active_sessions.get(sk)
+        interrupt_at_entry.append(bool(guard is not None and guard.is_set()))
+        if next_index[0] < N:
+            adapter._pending_messages[sk] = _make_event(text=f"M{next_index[0]}")
+            next_index[0] += 1
+        await asyncio.sleep(0.05)
+        if len(interrupt_at_entry) == N:
+            done.set()
+        return "ok"
+
+    adapter._message_handler = handler
+    await adapter.handle_message(_make_event(text="M0"))
+    await asyncio.wait_for(done.wait(), timeout=5)
+    terminal = adapter._session_tasks.get(sk)
+    if terminal is not None:
+        await asyncio.wait_for(terminal, timeout=5)
+    await adapter.cancel_background_tasks()
+
+    assert len(interrupt_at_entry) == N, interrupt_at_entry
+    assert interrupt_at_entry == [False] * N, (
+        "typing stop polluted session interrupt across in-band drain handoff: "
+        f"{interrupt_at_entry!r}"
     )
 
 
