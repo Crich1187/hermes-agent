@@ -5598,11 +5598,14 @@ class BasePlatformAdapter(ABC):
     ) -> None:
         """Stop the refresh task and platform typing state as one operation.
 
-        ``stop_event`` (when provided) is set before cancel so cooperative
-        waiters wake without relying solely on task cancellation. Do **not**
-        ``asyncio.shield`` the typing task: a shielded ``wait_for`` can time
-        out while leaving the task running, which stalls pending-drain handoff
-        and pytest-asyncio ``Runner.close`` (root-nypt.3 / root-nypt.9.1).
+        Optional ``stop_event`` is for a *dedicated* typing-stop signal only.
+        Never pass the session interrupt Event here — setting that on normal
+        cleanup falsely marks the turn interrupted and races pending-drain
+        / cancel cleanup (root-nypt.3).
+
+        Do **not** ``asyncio.shield`` the typing task: a shielded ``wait_for``
+        can time out while leaving the task running, which stalls handoff and
+        pytest-asyncio ``Runner.close``.
         """
         self._typing_paused.add(chat_id)
         try:
@@ -5610,12 +5613,11 @@ class BasePlatformAdapter(ABC):
                 stop_event.set()
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
-                try:
-                    await asyncio.wait_for(typing_task, timeout=timeout)
-                except (asyncio.CancelledError, asyncio.TimeoutError):
-                    # The task is cancelled; don't let a slow adapter-specific
-                    # cleanup block response delivery or shutdown.
-                    pass
+                # Use wait(), not await/wait_for on the cancelled task: awaiting
+                # a cancelled task raises CancelledError into *this* cleanup and
+                # previously got swallowed or confused with outer cancel
+                # (root-nypt.3 / root-nypt.9.1 Gate3). wait() only observes done.
+                await asyncio.wait({typing_task}, timeout=timeout)
             if not hasattr(self, "stop_typing"):
                 return
             attempts = max(1, stop_attempts)
@@ -6663,6 +6665,8 @@ class BasePlatformAdapter(ABC):
                 _keep_typing_sig = inspect.signature(self._keep_typing)
             except (TypeError, ValueError):
                 _keep_typing_sig = None
+            # Mid-turn interrupt still stops typing early via interrupt_event.
+            # Normal cleanup must NOT set that Event (see _stop_typing_task).
             if _keep_typing_sig is None or "stop_event" in _keep_typing_sig.parameters:
                 _keep_typing_kwargs["stop_event"] = interrupt_event
             typing_task = asyncio.create_task(
@@ -6673,13 +6677,13 @@ class BasePlatformAdapter(ABC):
             )
 
         async def _stop_typing_task() -> None:
-            # Wake cooperative stop_event waiters before cancel so typing
-            # cannot stall the pending-drain handoff or Runner.close.
+            # Cancel/join typing only. Do not pass interrupt_event as
+            # stop_event — setting it on normal cleanup falsely marks the
+            # turn interrupted and races pending-drain / cancel cleanup.
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
                 metadata=_thread_metadata,
-                stop_event=interrupt_event,
             )
         
         try:

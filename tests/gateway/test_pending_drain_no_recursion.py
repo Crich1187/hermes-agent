@@ -34,6 +34,17 @@ from gateway.platforms.base import (
 from gateway.session import SessionSource, build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _isolate_delivery_ledger(monkeypatch):
+    """Same isolation as test_pending_drain_race: shared ledger SQLite under
+    load slows handoff past tight wait_for budgets (pre-existing flake on
+    origin/main; root-nypt.3)."""
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.ledger_enabled",
+        lambda config=None: False,
+    )
+
+
 class _StubAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False):
         pass
@@ -49,7 +60,12 @@ class _StubAdapter(BasePlatformAdapter):
 
 
 def _make_adapter():
-    adapter = _StubAdapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
+    # Drain/stack/cancel invariants — not typing refresh. Typing-on + shared
+    # ledger contended the 2s drain_hit wait under serial stress.
+    adapter = _StubAdapter(
+        PlatformConfig(enabled=True, token="t", typing_indicator=False),
+        Platform.TELEGRAM,
+    )
     adapter._send_with_retry = AsyncMock(return_value=None)
     return adapter
 

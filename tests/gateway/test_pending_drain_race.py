@@ -23,7 +23,8 @@ dropping it.
 root-nypt.3: the handoff probe must not re-enter a hanging
 ``wait_for(asyncio.shield(typing_task))`` path after the sync point —
 that turned PASS into TimeoutError under load without an arbitrary sleep
-waiver. Production joins typing unshielded and sets ``stop_event``.
+waiver. Production joins typing via ``asyncio.wait`` (unshielded) and
+must not set the session interrupt Event from normal typing cleanup.
 """
 
 from __future__ import annotations
