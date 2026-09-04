@@ -3498,11 +3498,11 @@ class TestStandaloneSend:
 class TestBuzzAdapterEdit:
 
     @pytest.mark.asyncio
-    async def test_edit_targets_the_original_event_and_passes_content_on_argv(self):
-        """root-12e9: buzz-cli Edit does not read_or_stdin — never use --content -.
+    async def test_edit_targets_the_original_event_and_uses_stdin(self):
+        """root-12e9 Gate3 remediation: private edit body via stdin, never argv.
 
-        Passing ``--content -`` published the literal character ``-`` as the
-        edit body, freezing streamed previews at ``ROOT12E ▉``.
+        Household buzz-cli ≥ 023860d0 implements ``--content -`` for edit
+        (root-67m5i). Streaming partials must not land on subprocess argv.
         """
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
@@ -3516,17 +3516,16 @@ class TestBuzzAdapterEdit:
         args, stdin_text = cli.calls[0]
         assert args[:2] == ["messages", "edit"]
         assert args[args.index("--event") + 1] == "orig1"
-        assert args[args.index("--content") + 1] == "partial answer"
-        assert args[args.index("--content") + 1] != "-"
-        assert stdin_text is None
+        assert args[args.index("--content") + 1] == "-"
+        assert stdin_text == "partial answer"
 
     def test_prefers_fresh_final_streaming_for_cursor_preview_cleanup(self):
         adapter = _make_adapter()
         assert adapter.prefers_fresh_final_streaming("ROOT12E9-DM-deadbeef ACK") is True
 
     @pytest.mark.asyncio
-    async def test_edit_never_uses_content_dash_even_for_cursor_stripped_final(self):
-        """Regression: streaming finalize must not emit kind:40003 content '-'."""
+    async def test_edit_finalize_also_uses_stdin_not_argv(self):
+        """Finalize edits keep the same argv-safe stdin path as partials."""
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
         cli = _ScriptedCli()
@@ -3538,8 +3537,8 @@ class TestBuzzAdapterEdit:
         assert result.success is True
         args, stdin_text = cli.calls[0]
         assert "--content" in args
-        assert args[args.index("--content") + 1] == full
-        assert stdin_text is None
+        assert args[args.index("--content") + 1] == "-"
+        assert stdin_text == full
 
     @pytest.mark.asyncio
     async def test_edit_returns_the_original_id_not_the_cli_event_id(self):

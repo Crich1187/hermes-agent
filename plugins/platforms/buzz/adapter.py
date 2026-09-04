@@ -1510,19 +1510,18 @@ class BuzzAdapter(BasePlatformAdapter):
         ``finalize`` is a no-op here.  Buzz edits carry no lifecycle state, the
         same as Telegram, Slack and Discord.
 
-        Content is passed on argv (not ``--content -``). Unlike
-        ``messages send``, ``messages edit`` does **not** call
-        ``read_or_stdin``: a dash is published as the literal character
-        ``"-"`` (root-12e9), which froze streamed previews at
-        ``ROOT12E ▉`` while every "edit" wrote ``-``.
+        Content travels via stdin (``--content -``), matching ``messages send``.
+        Household buzz-cli ≥ ``023860d0`` implements ``read_or_stdin`` for edit
+        (root-67m5i). Passing the body on argv would expose every streaming
+        private-DM chunk to ``/proc/*/cmdline`` (Gate3 Major on root-12e9).
         """
         if not message_id:
             return SendResult(success=False, error="Buzz edit needs a message id")
         if not content:
             return SendResult(success=False, error="Empty message")
-        # Never use "--content -" here — see docstring / root-12e9.
-        args = ["messages", "edit", "--event", str(message_id), "--content", content]
-        code, out, err = await self._run_cli(args)
+        # Argv-safe: body on stdin, never on process argv (root-12e9 Gate3).
+        args = ["messages", "edit", "--event", str(message_id), "--content", "-"]
+        code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
                 success=False,
