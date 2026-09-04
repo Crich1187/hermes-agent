@@ -32,11 +32,23 @@ Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
     BUZZ_REACTION_ONLY_USERS, BUZZ_ALLOW_ALL_USERS, BUZZ_REPLY_IN_THREAD,
-    BUZZ_REPLY_TO_MODE
+    BUZZ_REPLY_TO_MODE, BUZZ_PRESENCE, BUZZ_PRESENCE_INTERVAL
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
 environment and is never logged.
+
+Presence semantics (kind:20001 over WebSocket — HTTP rejects ephemeral kinds)
+----------------------------------------------------------------------------
+* **online** — published once the adapter is connected (after NIP-42 auth when
+  the WebSocket transport is up; otherwise via a short-lived authenticated
+  WebSocket) and refreshed on each successful reconnect plus a periodic
+  heartbeat (default 60s, matching buzz-acp).
+* **offline** — published best-effort on graceful ``disconnect()`` / shutdown
+  before the inbound transport is torn down, clearing the relay presence
+  entry so fleet health no longer shows a stale online Athena.
+* Presence is independent of DM/channel message delivery: failures to publish
+  presence are logged and never fail ``connect()`` or block inbound dispatch.
 """
 
 import asyncio
@@ -299,6 +311,13 @@ def _attachment_origin(value: str) -> Optional[tuple[str, int]]:
 
 # WebSocket transport (NIP-42 authenticated Nostr subscription).
 # kind 44100 is Buzz's channel-membership event — used for live DM discovery.
+# Buzz presence (kind:20001). Must travel over WebSocket — the HTTP bridge
+# rejects ephemeral kinds 20000-29999 (same constraint as buzz-acp).
+_PRESENCE_KIND = 20001
+_PRESENCE_STATUSES = frozenset({"online", "away", "offline"})
+_DEFAULT_PRESENCE_INTERVAL = 60.0
+_PRESENCE_PUBLISH_TIMEOUT = 15.0
+
 _WS_AUTH_TIMEOUT = 20.0
 # Last-resort bound on how long the read loop may wait for a frame. The
 # library keepalive (ping_interval/ping_timeout below) should catch a dead
@@ -864,6 +883,33 @@ class BuzzAdapter(BasePlatformAdapter):
         ).strip().lower()
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
+        # Presence (kind:20001). Default on — fleet health expects Athena online
+        # while the gateway reports Buzz connected. Env BUZZ_PRESENCE /
+        # BUZZ_PRESENCE_INTERVAL override config.yaml.
+        _pres_raw = _scoped_platform_setting("BUZZ_PRESENCE", extra, "presence")
+        if _pres_raw is None:
+            _pres_cfg = extra.get("presence", True)
+        else:
+            _pres_cfg = _pres_raw
+        self._presence_enabled = str(_pres_cfg).strip().lower() not in (
+            "false",
+            "0",
+            "no",
+            "off",
+        )
+        _pres_iv_raw = _scoped_platform_setting(
+            "BUZZ_PRESENCE_INTERVAL", extra, "presence_interval"
+        )
+        try:
+            presence_interval = float(
+                _pres_iv_raw
+                if _pres_iv_raw is not None
+                else extra.get("presence_interval", _DEFAULT_PRESENCE_INTERVAL)
+            )
+        except (TypeError, ValueError):
+            presence_interval = _DEFAULT_PRESENCE_INTERVAL
+        self._presence_interval = max(5.0, presence_interval)
+
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
         raw_allowed = _scoped_platform_setting("BUZZ_ALLOWED_USERS", extra, "allowed_users")
         if raw_allowed is None:
@@ -909,6 +955,8 @@ class BuzzAdapter(BasePlatformAdapter):
         self._ws_task: Optional[asyncio.Task] = None
         self._ws_ready: Optional[asyncio.Event] = None
         self._ws_active = False  # True while the WS loop owns inbound delivery
+        self._ws = None  # live authenticated websocket (presence EVENT target)
+        self._presence_task: Optional[asyncio.Task] = None
         self._membership_since = 0
         self._lock_key: Optional[str] = None
         # channel_id -> {
@@ -1086,6 +1134,9 @@ class BuzzAdapter(BasePlatformAdapter):
         if transport_used == "poll":
             self._poll_task = asyncio.create_task(self._poll_loop())
         self._mark_connected()
+        # Presence is best-effort and never fails connect / DM delivery.
+        await self._publish_presence("online")
+        self._start_presence_heartbeat()
         logger.info(
             "Buzz: connected to %s as %s, watching %d channel(s) via %s%s",
             self.relay_url,
@@ -1100,6 +1151,13 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         """Stop the inbound transport and drop runtime state."""
+        # Stop refresh first so it cannot race an offline publish, then
+        # clear presence while the authenticated WS (if any) is still up.
+        await self._stop_presence_heartbeat()
+        try:
+            await self._publish_presence("offline")
+        except Exception:
+            logger.debug("Buzz: offline presence publish raised", exc_info=True)
         self._mark_disconnected()
         lock_key = getattr(self, "_lock_key", None)
         if lock_key:
@@ -1111,6 +1169,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 pass
             self._lock_key = None
         self._ws_active = False
+        self._ws = None
         if self._ws_task and not self._ws_task.done():
             self._ws_task.cancel()
             try:
@@ -1695,6 +1754,131 @@ class BuzzAdapter(BasePlatformAdapter):
                     pass
         return {"name": name or chat_id, "type": chat_type, "chat_id": chat_id}
 
+    # ── Presence (kind:20001 over WebSocket) ──────────────────────────────
+
+    def _start_presence_heartbeat(self) -> None:
+        # Fire-and-forget stop of any prior heartbeat; disconnect awaits the
+        # async stop path. create_task here matches _poll_task / _ws_task.
+        prior = self._presence_task
+        if prior is not None and not prior.done():
+            prior.cancel()
+        self._presence_task = None
+        if not self._presence_enabled:
+            return
+        self._presence_task = asyncio.create_task(self._presence_heartbeat_loop())
+
+    async def _stop_presence_heartbeat(self) -> None:
+        task = self._presence_task
+        self._presence_task = None
+        if task is None:
+            return
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug("Buzz: presence heartbeat stop raised", exc_info=True)
+
+    async def _presence_heartbeat_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(self._presence_interval)
+                await self._publish_presence("online")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Buzz: presence heartbeat loop exited", exc_info=True)
+
+    async def _publish_presence(self, status: str) -> bool:
+        """Publish kind:20001 presence. Never raises to callers; returns ok."""
+        if not self._presence_enabled:
+            return False
+        normalized = str(status or "").strip().lower()
+        if normalized not in _PRESENCE_STATUSES:
+            logger.warning("Buzz: ignoring invalid presence status %r", status)
+            return False
+        if not self._private_key:
+            return False
+        try:
+            build_presence_event = _load_nostr_auth().build_presence_event
+            event = build_presence_event(private_key=self._private_key, status=normalized)
+        except Exception as exc:
+            logger.warning("Buzz: failed to build presence event: %s", exc)
+            return False
+
+        # Prefer the live authenticated inbound WS (no second handshake).
+        ws = self._ws
+        if ws is not None and self._ws_active:
+            try:
+                await ws.send(json.dumps(["EVENT", event], separators=(",", ":")))
+                logger.debug("Buzz: presence %s published on live WebSocket", normalized)
+                return True
+            except Exception as exc:
+                logger.debug(
+                    "Buzz: live WebSocket presence publish failed (%s); trying oneshot",
+                    exc,
+                )
+
+        return await self._publish_presence_oneshot(event, normalized)
+
+    async def _publish_presence_oneshot(self, event: dict, status: str) -> bool:
+        """Open a short-lived authenticated WS solely to publish presence."""
+        try:
+            import websockets
+        except Exception as exc:
+            logger.debug("Buzz: presence oneshot unavailable (no websockets): %s", exc)
+            return False
+        try:
+            ws_url = self._websocket_url()
+        except Exception as exc:
+            logger.debug("Buzz: presence oneshot bad relay URL: %s", exc)
+            return False
+
+        try:
+            async with websockets.connect(
+                ws_url,
+                open_timeout=_WS_AUTH_TIMEOUT,
+                close_timeout=5,
+                ping_interval=None,
+                max_size=_WS_MAX_MESSAGE_BYTES,
+            ) as websocket:
+                await asyncio.wait_for(
+                    self._authenticate_websocket(websocket),
+                    timeout=_PRESENCE_PUBLISH_TIMEOUT,
+                )
+                await websocket.send(json.dumps(["EVENT", event], separators=(",", ":")))
+                # Drain until OK for this event or timeout — ignore unrelated frames.
+                deadline = time.monotonic() + _PRESENCE_PUBLISH_TIMEOUT
+                while time.monotonic() < deadline:
+                    remaining = deadline - time.monotonic()
+                    raw = await asyncio.wait_for(websocket.recv(), timeout=max(remaining, 0.1))
+                    try:
+                        message = json.loads(raw)
+                    except (ValueError, TypeError):
+                        continue
+                    if (
+                        isinstance(message, list)
+                        and message
+                        and message[0] == "OK"
+                        and len(message) >= 3
+                        and message[1] == event.get("id")
+                    ):
+                        if message[2] is True:
+                            logger.debug("Buzz: presence %s published via oneshot WS", status)
+                            return True
+                        logger.warning(
+                            "Buzz: presence %s rejected by relay: %s",
+                            status,
+                            message[3] if len(message) > 3 else "rejected",
+                        )
+                        return False
+            return False
+        except Exception as exc:
+            logger.warning("Buzz: presence %s oneshot publish failed: %s", status, exc)
+            return False
+
     # ── Inbound: WebSocket transport (NIP-42 authenticated) ──────────────
     #
     # Push transport contributed in PR #73636 by @ScaleLeanChris, adapted to
@@ -1895,10 +2079,14 @@ class BuzzAdapter(BasePlatformAdapter):
                     ) as websocket:
                         await self._authenticate_websocket(websocket)
                         subscriptions = await self._subscribe_websocket(websocket)
+                        self._ws = websocket
                         self._ws_active = True
                         if self._ws_ready is not None:
                             self._ws_ready.set()
                         backoff = 1.0
+                        # Refresh online on every successful (re)connect so
+                        # fleet presence matches gateway_state "connected".
+                        await self._publish_presence("online")
                         # Companion sweep: relays don't guarantee a membership
                         # event per new conversation (#93557), so discovery
                         # also runs on the poll transport's cadence.
@@ -1978,15 +2166,19 @@ class BuzzAdapter(BasePlatformAdapter):
                                 await discovery_task
                             except (asyncio.CancelledError, Exception):
                                 pass
+                            if self._ws is websocket:
+                                self._ws = None
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
                     self._ws_active = False
+                    self._ws = None
                     logger.warning("Buzz: WebSocket disconnected; retrying in %.1fs: %s", backoff, e)
                     await asyncio.sleep(backoff)
                     backoff = min(backoff * 2, 30.0)
         finally:
             self._ws_active = False
+            self._ws = None
 
     # ── Inbound polling ───────────────────────────────────────────────────
 

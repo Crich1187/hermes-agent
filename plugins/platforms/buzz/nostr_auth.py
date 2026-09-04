@@ -180,6 +180,82 @@ def schnorr_sign(
     return nonce_x + signature_scalar.to_bytes(32, "big")
 
 
+def build_signed_event(
+    *,
+    private_key: str,
+    kind: int,
+    content: str = "",
+    tags: Optional[list[list[str]]] = None,
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build a BIP-340-signed Nostr event (NIP-01 shape).
+
+    Used for NIP-42 AUTH (kind 22242) and ephemeral presence updates
+    (kind 20001). Ephemeral kinds must be published over WebSocket — the
+    Buzz HTTP bridge rejects kinds 20000-29999.
+    """
+    if not isinstance(kind, int) or kind < 0:
+        raise ValueError("kind must be a non-negative integer")
+    if not isinstance(content, str):
+        raise ValueError("content must be a string")
+    event_tags = list(tags or [])
+    for tag in event_tags:
+        if (
+            not isinstance(tag, list)
+            or not tag
+            or not all(isinstance(part, str) for part in tag)
+        ):
+            raise ValueError("tags must be a list of string lists")
+
+    pubkey = public_key_hex(private_key)
+    timestamp = int(time.time()) if created_at is None else int(created_at)
+    serialized = json.dumps(
+        [0, pubkey, timestamp, kind, event_tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+    event_id = hashlib.sha256(serialized).digest()
+    return {
+        "id": event_id.hex(),
+        "pubkey": pubkey,
+        "created_at": timestamp,
+        "kind": kind,
+        "tags": event_tags,
+        "content": content,
+        "sig": schnorr_sign(
+            event_id,
+            private_key,
+            auxiliary_randomness=auxiliary_randomness,
+        ).hex(),
+    }
+
+
+def build_presence_event(
+    *,
+    private_key: str,
+    status: str,
+    created_at: Optional[int] = None,
+    auxiliary_randomness: Optional[bytes] = None,
+) -> dict[str, Any]:
+    """Build a kind:20001 presence event with bare status content.
+
+    Content matches Buzz Desktop / buzz-acp: ``online``, ``away``, or
+    ``offline``. ``offline`` clears the relay's presence entry.
+    """
+    normalized = str(status or "").strip().lower()
+    if normalized not in {"online", "away", "offline"}:
+        raise ValueError("presence status must be online, away, or offline")
+    return build_signed_event(
+        private_key=private_key,
+        kind=20001,
+        content=normalized,
+        tags=[],
+        created_at=created_at,
+        auxiliary_randomness=auxiliary_randomness,
+    )
+
+
 def build_auth_event(
     *,
     private_key: str,
@@ -207,24 +283,11 @@ def build_auth_event(
             raise ValueError("BUZZ_AUTH_TAG must be a four-string auth tag")
         tags.append(auth_tag)
 
-    pubkey = public_key_hex(private_key)
-    timestamp = int(time.time()) if created_at is None else int(created_at)
-    serialized = json.dumps(
-        [0, pubkey, timestamp, 22242, tags, ""],
-        separators=(",", ":"),
-        ensure_ascii=False,
-    ).encode()
-    event_id = hashlib.sha256(serialized).digest()
-    return {
-        "id": event_id.hex(),
-        "pubkey": pubkey,
-        "created_at": timestamp,
-        "kind": 22242,
-        "tags": tags,
-        "content": "",
-        "sig": schnorr_sign(
-            event_id,
-            private_key,
-            auxiliary_randomness=auxiliary_randomness,
-        ).hex(),
-    }
+    return build_signed_event(
+        private_key=private_key,
+        kind=22242,
+        content="",
+        tags=tags,
+        created_at=created_at,
+        auxiliary_randomness=auxiliary_randomness,
+    )

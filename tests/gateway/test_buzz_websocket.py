@@ -680,3 +680,149 @@ async def test_ws_discovery_task_cancelled_when_connection_exits(monkeypatch):
 
     assert started, "discovery task was never started with the connection"
     assert all(t.done() for t in started), "discovery task outlived its connection"
+
+
+# ── Presence lifecycle (root-12e9) ─────────────────────────────────────────
+
+
+def test_build_presence_event_shape_and_status():
+    event = nostr_auth.build_presence_event(
+        private_key=TEST_PRIVATE_KEY,
+        status="online",
+        created_at=1_700_000_000,
+        auxiliary_randomness=bytes(32),
+    )
+    assert event["kind"] == 20001
+    assert event["content"] == "online"
+    assert event["tags"] == []
+    assert event["pubkey"] == nostr_auth.public_key_hex(TEST_PRIVATE_KEY)
+    assert len(bytes.fromhex(event["sig"])) == 64
+    with pytest.raises(ValueError):
+        nostr_auth.build_presence_event(private_key=TEST_PRIVATE_KEY, status="nope")
+
+
+@pytest.mark.asyncio
+async def test_publish_presence_online_uses_live_websocket(monkeypatch):
+    adapter = _make_adapter()
+    adapter._presence_enabled = True
+    sent = []
+
+    class LiveWs:
+        async def send(self, raw):
+            sent.append(json.loads(raw))
+
+    adapter._ws = LiveWs()
+    adapter._ws_active = True
+
+    ok = await adapter._publish_presence("online")
+    assert ok is True
+    assert len(sent) == 1
+    assert sent[0][0] == "EVENT"
+    assert sent[0][1]["kind"] == 20001
+    assert sent[0][1]["content"] == "online"
+
+
+@pytest.mark.asyncio
+async def test_disconnect_publishes_offline_before_teardown(monkeypatch):
+    adapter = _make_adapter()
+    adapter._presence_enabled = True
+    statuses = []
+
+    async def capture(status):
+        statuses.append(status)
+        return True
+
+    monkeypatch.setattr(adapter, "_publish_presence", capture)
+    # Avoid real lock/status imports
+    adapter._lock_key = None
+    adapter._ws_task = None
+    adapter._poll_task = None
+    adapter._presence_task = asyncio.create_task(asyncio.sleep(3600))
+
+    await adapter.disconnect()
+    assert statuses == ["offline"]
+    assert adapter._presence_task is None or adapter._presence_task.cancelled() or adapter._presence_task.done()
+
+
+@pytest.mark.asyncio
+async def test_websocket_reconnect_republishes_online(monkeypatch):
+    """Each successful WS (re)auth must refresh online presence."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+    import sys
+
+    adapter = _make_adapter()
+    adapter._presence_enabled = True
+    adapter._channel_state = {CHANNEL: {"chat_type": "group", "last_ts": 1, "seen": {}}}
+    published = []
+
+    async def capture(status):
+        published.append(status)
+        return True
+
+    monkeypatch.setattr(adapter, "_publish_presence", capture)
+    monkeypatch.setattr(adapter, "_authenticate_websocket", AsyncMock())
+    monkeypatch.setattr(adapter, "_subscribe_websocket", AsyncMock(return_value={}))
+    monkeypatch.setattr(adapter, "_ws_discovery_loop", AsyncMock())
+
+    class _OnceWs:
+        def __init__(self):
+            self._served = False
+
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            # Immediate clean close so the outer loop reconnects.
+            raise StopAsyncIteration
+
+    class _ConnectCM:
+        def __init__(self, ws):
+            self._ws = ws
+
+        async def __aenter__(self):
+            return self._ws
+
+        async def __aexit__(self, *exc):
+            return False
+
+    sockets = []
+
+    def connect_factory(*_a, **_kw):
+        ws = _OnceWs()
+        sockets.append(ws)
+        if len(sockets) > 3:
+            # Park after enough reconnects so the test can cancel cleanly.
+            class _Park:
+                async def __aenter__(self):
+                    await asyncio.Event().wait()
+                    return self
+
+                async def __aexit__(self, *exc):
+                    return False
+
+                def __aiter__(self):
+                    return self
+
+                async def __anext__(self):
+                    await asyncio.Event().wait()
+
+            return _Park()
+        return _ConnectCM(ws)
+
+    fake_ws_mod = MagicMock()
+    fake_ws_mod.connect = connect_factory
+
+    with patch.dict(sys.modules, {"websockets": fake_ws_mod}):
+        task = asyncio.create_task(adapter._websocket_loop())
+        try:
+            deadline = time.monotonic() + 3.0
+            while len(published) < 2 and time.monotonic() < deadline:
+                await asyncio.sleep(0.02)
+        finally:
+            task.cancel()
+            try:
+                await asyncio.wait_for(task, 2.0)
+            except (asyncio.CancelledError, asyncio.TimeoutError):
+                pass
+
+    assert published.count("online") >= 2, published
