@@ -701,6 +701,62 @@ class TestSecurity:
         result = mgr.restore(str(work_dir), cps[0]["hash"], file_path="subdir/test.txt")
         assert result["success"] is True
 
+    def test_restore_rejects_symlink_escape(self, mgr, work_dir, tmp_path):
+        """Symlink that resolves outside the workdir must fail closed."""
+        outside = tmp_path / "outside_secret.txt"
+        outside.write_text("do-not-touch\n")
+        link = work_dir / "escape.link"
+        link.symlink_to(outside)
+
+        mgr.ensure_checkpoint(str(work_dir), "initial")
+        cps = mgr.list_checkpoints(str(work_dir))
+        target_hash = cps[0]["hash"]
+
+        result = mgr.restore(str(work_dir), target_hash, file_path="escape.link")
+        assert result["success"] is False
+        assert "escapes the working directory" in result["error"]
+        # Outside target must remain untouched by a rejected restore.
+        assert outside.read_text() == "do-not-touch\n"
+
+
+# =========================================================================
+# root-myx acceptance: list / missing / exact-byte restore
+# =========================================================================
+
+class TestRootMyxRollbackAcceptance:
+    def test_list_no_target_returns_empty(self, mgr, work_dir):
+        assert mgr.list_checkpoints(str(work_dir)) == []
+        assert "No checkpoints found" in format_checkpoint_list([], str(work_dir))
+
+    def test_restore_missing_checkpoint_hash(self, mgr, work_dir):
+        mgr.ensure_checkpoint(str(work_dir), "seed")
+        result = mgr.restore(str(work_dir), "deadbeefcafe")
+        assert result["success"] is False
+        assert "not found" in result["error"].lower() or "Checkpoint" in result["error"]
+
+    def test_exact_byte_restore_single_file(self, mgr, work_dir):
+        import hashlib
+        import os
+
+        path = work_dir / "disposable.bin"
+        original = b"root-myx-exact-bytes\n" + os.urandom(64)
+        path.write_bytes(original)
+        orig_sha = hashlib.sha256(original).hexdigest()
+
+        assert mgr.ensure_checkpoint(str(work_dir), "before mutate") is True
+        cps = mgr.list_checkpoints(str(work_dir))
+        assert cps
+        target_hash = cps[0]["hash"]
+
+        path.write_bytes(b"MUTATED")
+        assert hashlib.sha256(path.read_bytes()).hexdigest() != orig_sha
+
+        result = mgr.restore(str(work_dir), target_hash, file_path="disposable.bin")
+        assert result["success"] is True
+        restored = path.read_bytes()
+        assert restored == original
+        assert hashlib.sha256(restored).hexdigest() == orig_sha
+
 
 # =========================================================================
 # GPG / global git config isolation

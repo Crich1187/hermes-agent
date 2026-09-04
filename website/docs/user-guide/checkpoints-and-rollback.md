@@ -238,6 +238,26 @@ hermes checkpoints clear-legacy
 
 to reclaim the space. Legacy archives are also swept by `auto_prune` after `retention_days`.
 
+## `/rollback` vs Git vs `/snapshot`
+
+These three mechanisms solve different undo problems. Do not treat them as
+interchangeable:
+
+| Mechanism | What it restores | Storage | Typical use |
+|---|---|---|---|
+| **`/rollback`** | Files in the **project working tree** that Hermes checkpointed before agent mutations | Shadow git store under `~/.hermes/checkpoints/store/` (never your project's `.git`) | Fast undo when an agent edit broke code; list with `/rollback`, restore with `/rollback <N>` |
+| **Git** (`git checkout` / `git restore` / `git reset`) | Files tracked in the **real repository** history / index | The project's own `.git` | Version control, commits, branches, PR workflows. Checkpoints do **not** create git commits in your repo |
+| **`/snapshot`** (CLI alias `/snap`) | **Hermes config/state** (profile/config snapshots), not project source files | Hermes state-snapshot store (see `/snapshot` help) | Recover Hermes settings/state after a bad config change; complementary to `/rollback` |
+
+Rules of thumb:
+
+- Broke **code the agent just edited** → `/rollback` (or `hermes checkpoints` to inspect the store).
+- Need a **committed** history or branch undo → **git**.
+- Broke **Hermes itself** (config/skills wiring/state) → **`/snapshot`**, not `/rollback`.
+
+`/rollback` never mutates your project's `.git`. `/snapshot` never restores
+arbitrary project files. Git never reads the Hermes checkpoint store.
+
 ## Best Practices
 
 - **Enable checkpoints only when you need them** — `hermes chat --checkpoints` or per-profile `enabled: true`.
