@@ -1615,6 +1615,42 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_foreign_p_tag_same_display_name_does_not_dispatch(self, adapter):
+        """root-jryjt: Pepper Athena must not answer a CMR Athena p-tag.
+
+        Same short display name ("Athena") in the message body must not
+        override a signed recipient p-tag targeting a different pubkey.
+        """
+        adapter._display_name = "Athena"
+        # CMR Athena pubkey shape from root-r3cmq (prefix preserved; pad to 64).
+        cmr_athena = "47f74dad" + ("a" * 56)
+        assert len(cmr_athena) == 64
+        event = _event(
+            "e1",
+            content="@Athena (cmr) reply with exactly: PONG-jryjt-hermes",
+            created_at=10,
+        )
+        event["tags"].append(["p", cmr_athena])
+        await self._poll_with(adapter, event)
+        assert adapter._dispatched == []
+        assert adapter._is_addressed(event) is False
+        # Text alone (no p-tags) would still match the shared display name.
+        text_only = _event("e2", content="@Athena hello", created_at=11)
+        assert adapter._is_addressed(text_only) is True
+
+    @pytest.mark.asyncio
+    async def test_own_p_tag_with_shared_display_name_still_dispatches(self, adapter):
+        adapter._display_name = "Athena"
+        event = _event(
+            "e1",
+            content="@Athena please acknowledge",
+            created_at=10,
+        )
+        event["tags"].append(["p", SELF_PUBKEY])
+        await self._poll_with(adapter, event)
+        assert len(adapter._dispatched) == 1
+
+    @pytest.mark.asyncio
     async def test_require_mention_false_still_dispatches_unaddressed_message(self, adapter):
         adapter.require_mention = False
         await self._poll_with(adapter, _event("e1", content="just chatting", created_at=10))

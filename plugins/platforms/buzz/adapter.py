@@ -2441,8 +2441,10 @@ class BuzzAdapter(BasePlatformAdapter):
         # A NIP-10 thread reply whose direct parent is one of our messages is
         # treated as addressed (parity with Signal/WhatsApp; fixes #75826 —
         # e.g. Desktop "/approve session" replies that never type @name).
-        # Explicit addressing is a text @mention OR a signed recipient p-tag
-        # (#92781). DMs always dispatch.
+        # Explicit addressing: signed recipient p-tags are authoritative when
+        # present (#root-jryjt — shared display names must not claim another
+        # pubkey's mention). Otherwise a text @mention / npub / hex (#92781).
+        # DMs always dispatch.
         if (
             not is_dm
             and self.require_mention
@@ -2570,20 +2572,28 @@ class BuzzAdapter(BasePlatformAdapter):
         description = str(meta.get("description") or "").strip()
         return name == "DM" and not description
 
+    def _recipient_p_pubkeys(self, event: dict) -> set[str]:
+        """Hex pubkeys from signed ``p`` tags on *event* (recipient addressing)."""
+        tags = event.get("tags")
+        if not isinstance(tags, list):
+            return set()
+        out: set[str] = set()
+        for tag in tags:
+            if (
+                isinstance(tag, (list, tuple))
+                and len(tag) > 1
+                and tag[0] == "p"
+            ):
+                pk = str(tag[1]).lower()
+                if re.fullmatch(r"[0-9a-f]{64}", pk):
+                    out.add(pk)
+        return out
+
     def _p_tagged_to_self(self, event: dict) -> bool:
         """True when the signed event addresses this identity by pubkey."""
         if not self._self_pubkey:
             return False
-        tags = event.get("tags")
-        if not isinstance(tags, list):
-            return False
-        return any(
-            isinstance(tag, (list, tuple))
-            and len(tag) > 1
-            and tag[0] == "p"
-            and str(tag[1]).lower() == self._self_pubkey
-            for tag in tags
-        )
+        return self._self_pubkey in self._recipient_p_pubkeys(event)
 
     def _is_direct_message_event(self, channel_id: str, event: dict) -> bool:
         """True when ``event`` is shaped like a direct message to us: a chat
@@ -2633,12 +2643,21 @@ class BuzzAdapter(BasePlatformAdapter):
         return False
 
     def _is_addressed(self, event: dict) -> bool:
-        """True when a group event carries an explicit text or p-tag address."""
+        """True when a group event explicitly addresses this identity.
+
+        When the event carries one or more recipient ``p`` tags, those tags
+        alone decide addressing: display-name / text mentions must not wake
+        this agent for a different pubkey (same short name, different host —
+        e.g. Pepper Athena vs CMR Athena). With no recipient ``p`` tags,
+        fall back to text / npub / hex mention matching.
+        """
         content = event.get("content")
-        return (
-            isinstance(content, str)
-            and (self._is_mentioned(content) or self._p_tagged_to_self(event))
-        )
+        if not isinstance(content, str):
+            return False
+        recipients = self._recipient_p_pubkeys(event)
+        if recipients:
+            return bool(self._self_pubkey) and self._self_pubkey in recipients
+        return self._is_mentioned(content)
 
     def _strip_mention(self, content: str) -> str:
         """Remove a leading @mention of this agent so the remaining text can be
