@@ -506,7 +506,7 @@ async def test_closed_membership_phrases_prune_without_reconnect(detail):
     """Every production-observed membership-rejection phrasing (#76850,
     #97502) prunes the subscription instead of tearing down the socket."""
     import sys
-    from unittest.mock import patch, MagicMock
+    from unittest.mock import AsyncMock, MagicMock, patch
     from contextlib import asynccontextmanager
 
     adapter = _make_adapter(extra={"channels": [CHANNEL]})
@@ -549,11 +549,16 @@ async def test_closed_membership_phrases_prune_without_reconnect(detail):
         patch.dict(sys.modules, {"websockets": fake_ws_mod}),
         patch.object(type(adapter), "_authenticate_websocket", _noop_auth),
         patch.object(type(adapter), "_subscribe_websocket", _noop_subscribe),
+        # Presence publish after auth adds an await before CLOSED is read;
+        # keep it a no-op so this membership-prune test stays timing-stable.
+        patch.object(type(adapter), "_publish_presence", AsyncMock(return_value=True)),
     ):
         adapter._ws_ready = asyncio.Event()
         adapter._ws_ready.set()
         task = asyncio.create_task(adapter._websocket_loop())
-        await asyncio.sleep(0.1)
+        deadline = time.monotonic() + 2.0
+        while CHANNEL not in adapter._restricted_channels and time.monotonic() < deadline:
+            await asyncio.sleep(0.02)
 
     assert CHANNEL in adapter._restricted_channels
     assert CHANNEL not in adapter._channel_state

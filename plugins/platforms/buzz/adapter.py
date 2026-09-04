@@ -1469,6 +1469,22 @@ class BuzzAdapter(BasePlatformAdapter):
             return False
         return True
 
+    def prefers_fresh_final_streaming(
+        self,
+        content: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Finalize streamed Buzz replies as a fresh kind:9 send.
+
+        Mid-stream previews are kind:9 plus kind:40003 edits. ``messages get``
+        returns the original kind:9 body unless the caller resolves edits, and
+        a frozen streaming cursor (``ROOT12E ▉``, root-12e9) is exactly that
+        unrepaired preview. Preferring a fresh final makes the completed answer
+        a distinct Athena-signed kind:9 event and best-effort deletes the
+        cursor preview.
+        """
+        return True
+
     async def edit_message(
         self,
         chat_id: str,
@@ -1493,13 +1509,20 @@ class BuzzAdapter(BasePlatformAdapter):
 
         ``finalize`` is a no-op here.  Buzz edits carry no lifecycle state, the
         same as Telegram, Slack and Discord.
+
+        Content is passed on argv (not ``--content -``). Unlike
+        ``messages send``, ``messages edit`` does **not** call
+        ``read_or_stdin``: a dash is published as the literal character
+        ``"-"`` (root-12e9), which froze streamed previews at
+        ``ROOT12E ▉`` while every "edit" wrote ``-``.
         """
         if not message_id:
             return SendResult(success=False, error="Buzz edit needs a message id")
         if not content:
             return SendResult(success=False, error="Empty message")
-        args = ["messages", "edit", "--event", str(message_id), "--content", "-"]
-        code, out, err = await self._run_cli(args, input_text=content)
+        # Never use "--content -" here — see docstring / root-12e9.
+        args = ["messages", "edit", "--event", str(message_id), "--content", content]
+        code, out, err = await self._run_cli(args)
         if code != 0:
             return SendResult(
                 success=False,

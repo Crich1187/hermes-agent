@@ -3498,7 +3498,12 @@ class TestStandaloneSend:
 class TestBuzzAdapterEdit:
 
     @pytest.mark.asyncio
-    async def test_edit_targets_the_original_event_and_uses_stdin(self):
+    async def test_edit_targets_the_original_event_and_passes_content_on_argv(self):
+        """root-12e9: buzz-cli Edit does not read_or_stdin — never use --content -.
+
+        Passing ``--content -`` published the literal character ``-`` as the
+        edit body, freezing streamed previews at ``ROOT12E ▉``.
+        """
         adapter = _make_adapter()
         adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
         cli = _ScriptedCli()
@@ -3511,9 +3516,30 @@ class TestBuzzAdapterEdit:
         args, stdin_text = cli.calls[0]
         assert args[:2] == ["messages", "edit"]
         assert args[args.index("--event") + 1] == "orig1"
-        # Content travels via stdin (--content -), never argv, same as send
-        assert args[args.index("--content") + 1] == "-"
-        assert stdin_text == "partial answer"
+        assert args[args.index("--content") + 1] == "partial answer"
+        assert args[args.index("--content") + 1] != "-"
+        assert stdin_text is None
+
+    def test_prefers_fresh_final_streaming_for_cursor_preview_cleanup(self):
+        adapter = _make_adapter()
+        assert adapter.prefers_fresh_final_streaming("ROOT12E9-DM-deadbeef ACK") is True
+
+    @pytest.mark.asyncio
+    async def test_edit_never_uses_content_dash_even_for_cursor_stripped_final(self):
+        """Regression: streaming finalize must not emit kind:40003 content '-'."""
+        adapter = _make_adapter()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        cli = _ScriptedCli()
+        full = "ROOT12E9-DM-7a334fc6 ACK"
+        cli.script("messages", "edit", {"accepted": True, "event_id": "edit-final"})
+        adapter._run_cli = cli
+
+        result = await adapter.edit_message(CHANNEL, "preview1", full, finalize=True)
+        assert result.success is True
+        args, stdin_text = cli.calls[0]
+        assert "--content" in args
+        assert args[args.index("--content") + 1] == full
+        assert stdin_text is None
 
     @pytest.mark.asyncio
     async def test_edit_returns_the_original_id_not_the_cli_event_id(self):
