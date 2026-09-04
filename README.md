@@ -93,9 +93,39 @@ Hermes has two entry points: start the terminal UI with `hermes`, or run the gat
 | Compress context / check usage | `/compress`, `/usage`, `/insights [--days N]` | `/compress`, `/usage`, `/insights [days]` |
 | Browse skills | `/skills` or `/<skill-name>` | `/<skill-name>` |
 | Interrupt current work | `Ctrl+C` or send a new message | `/stop` or send a new message |
+| Course-correct **without** interrupting | `/steer <note>`, `/queue <prompt>` | `/steer <note>`, `/queue <prompt>` |
 | Platform-specific status | `/platforms` | `/status`, `/sethome` |
 
 For the full command lists, see the [CLI guide](https://hermes-agent.nousresearch.com/docs/user-guide/cli) and the [Messaging Gateway guide](https://hermes-agent.nousresearch.com/docs/user-guide/messaging).
+
+### Course-correcting a run in progress
+
+When an agent is heading the wrong way, you don't have to abandon the run and
+lose the session. Two commands change direction while the turn keeps going:
+
+| Command | When it lands | Use it for |
+|---------|---------------|------------|
+| `/steer <note>` | **Inside the current run**, appended to the next tool result | "also check `auth.log`", "skip the vendored dirs" — a nudge the agent should act on *now* |
+| `/queue <prompt>` | **After the current run finishes**, as its own next turn | "then write the summary" — follow-up work that shouldn't disturb the turn in flight |
+
+```bash
+/steer also check auth.log      # arrives after the next tool call, no interrupt
+/queue then write the report    # runs as the next turn, once this one ends
+```
+
+Behaviour worth knowing:
+
+- **Neither command interrupts.** The active turn keeps its context, and
+  `/steer` is injected into a tool result rather than as a new user message, so
+  role alternation and prompt caching are preserved.
+- **`/steer` needs a live run.** With no agent running — or while one is still
+  starting — it falls back to queueing as the next turn and tells you so.
+- **Ordering is deterministic.** Repeated `/queue` calls stack FIFO, each
+  becoming its own turn; they are never merged, reordered, or dropped. A
+  `/steer` that lands in the run is *not* also replayed as a queued turn.
+- **`Enter` can do this for you.** `/busy steer` or `/busy queue` makes plain
+  messages typed during a run behave like `/steer` or `/queue` instead of
+  interrupting.
 
 ---
 
