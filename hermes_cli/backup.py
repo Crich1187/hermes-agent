@@ -481,6 +481,8 @@ _QUICK_STATE_FILES = (
     "config.yaml",
     ".env",
     "auth.json",
+    "SOUL.md",
+    "AGENTS.md",
     "cron/jobs.json",
     "gateway_state.json",
     "channel_directory.json",
@@ -493,6 +495,88 @@ _QUICK_STATE_FILES = (
 
 _QUICK_SNAPSHOTS_DIR = "state-snapshots"
 _QUICK_DEFAULT_KEEP = 20
+
+# Snapshot IDs must be a single directory name under state-snapshots/.
+_SNAPSHOT_ID_FORBIDDEN = ("/", "\\", "..")
+
+
+def _sanitize_snapshot_label(label: Optional[str]) -> Optional[str]:
+    """Normalize a user label into a path-safe snapshot id suffix."""
+    if label is None:
+        return None
+    text = str(label).strip()
+    if not text:
+        return None
+    # Collapse whitespace; reject path separators / traversal tokens.
+    text = "_".join(text.split())
+    for bad in _SNAPSHOT_ID_FORBIDDEN:
+        if bad in text:
+            raise ValueError(
+                f"snapshot label must not contain path separators or '..' ({label!r})"
+            )
+    if text.startswith(".") or text.endswith("."):
+        raise ValueError(f"snapshot label must not start/end with '.' ({label!r})")
+    return text
+
+
+def _validate_snapshot_id(snapshot_id: str) -> str:
+    """Fail closed unless snapshot_id is a single safe directory name."""
+    sid = str(snapshot_id or "").strip()
+    if not sid or sid in {".", ".."}:
+        raise ValueError("snapshot id must be a non-empty directory name")
+    if "/" in sid or "\\" in sid or ".." in sid:
+        raise ValueError(f"snapshot id must not contain path separators or '..' ({sid!r})")
+    if Path(sid).is_absolute():
+        raise ValueError(f"snapshot id must be relative ({sid!r})")
+    return sid
+
+
+def _is_within(root: Path, candidate: Path) -> bool:
+    """Return True if candidate resolves strictly under root (no escape)."""
+    try:
+        candidate.resolve().relative_to(root.resolve())
+        return True
+    except (ValueError, OSError):
+        return False
+
+
+def _safe_src_under_home(home: Path, rel: str) -> Optional[Path]:
+    """Resolve a relative state path under HERMES_HOME; None if unsafe/missing.
+
+    Symlinks are allowed only when their *resolved* target stays inside home.
+    """
+    rel_text = str(rel).replace("\\", "/").strip()
+    if not rel_text or rel_text.startswith("/"):
+        return None
+    if ".." in Path(rel_text).parts:
+        return None
+    src = home / rel_text
+    try:
+        src.resolve().relative_to(home.resolve())
+    except (ValueError, OSError):
+        return None
+    if not src.exists():
+        return None
+    if src.is_symlink() or src.is_file() or src.is_dir():
+        if not _is_within(home, src):
+            logger.warning("Skipping snapshot path escaping HERMES_HOME: %s", rel_text)
+            return None
+        return src
+    return None
+
+
+def _safe_dst_under(root: Path, rel: str) -> Optional[Path]:
+    """Build a destination path under root; None on traversal."""
+    rel_text = str(rel).replace("\\", "/").strip()
+    if not rel_text or rel_text.startswith("/") or ".." in Path(rel_text).parts:
+        return None
+    dst = root / rel_text
+    try:
+        # Lexical + resolve check (parent may not exist yet).
+        dst.resolve().relative_to(root.resolve())
+    except (ValueError, OSError):
+        return None
+    return dst
 
 
 def _quick_snapshot_root(hermes_home: Optional[Path] = None) -> Path:
@@ -511,43 +595,70 @@ def create_quick_snapshot(
 
     Returns:
         Snapshot ID (timestamp-based), or None if no files found.
+
+    Raises:
+        ValueError: if ``label`` contains path separators / traversal tokens.
     """
-    home = hermes_home or get_hermes_home()
+    home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+    home = home.resolve()
     root = _quick_snapshot_root(home)
 
+    safe_label = _sanitize_snapshot_label(label)
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    snap_id = f"{ts}-{label}" if label else ts
+    snap_id = f"{ts}-{safe_label}" if safe_label else ts
     snap_dir = root / snap_id
     snap_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
 
     for rel in _QUICK_STATE_FILES:
-        src = home / rel
-        if not src.exists():
+        src = _safe_src_under_home(home, rel)
+        if src is None:
             continue
 
         if src.is_dir():
-            # Walk the directory and record each file individually in the
-            # manifest so restore can treat them uniformly.  Empty dirs are
-            # skipped (nothing to snapshot).
+            # Walk without following directory symlinks out of home.
             for sub in src.rglob("*"):
+                if sub.is_symlink():
+                    if not _is_within(home, sub):
+                        logger.warning(
+                            "Skipping symlink escaping HERMES_HOME during snapshot: %s",
+                            sub,
+                        )
+                        continue
                 if not sub.is_file():
                     continue
+                if not _is_within(home, sub):
+                    logger.warning(
+                        "Skipping file escaping HERMES_HOME during snapshot: %s", sub
+                    )
+                    continue
                 sub_rel = sub.relative_to(home).as_posix()
-                dst = snap_dir / sub_rel
+                dst = _safe_dst_under(snap_dir, sub_rel)
+                if dst is None:
+                    logger.warning("Skipping unsafe relative path in snapshot: %s", sub_rel)
+                    continue
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
-                    shutil.copy2(sub, dst)
+                    shutil.copy2(sub, dst, follow_symlinks=True)
+                    # After copy, ensure destination still under snap_dir.
+                    if not _is_within(snap_dir, dst):
+                        dst.unlink(missing_ok=True)
+                        continue
                     manifest[sub_rel] = dst.stat().st_size
                 except (OSError, PermissionError) as exc:
                     logger.warning("Could not snapshot %s: %s", sub_rel, exc)
             continue
 
+        if src.is_symlink() and not _is_within(home, src):
+            logger.warning("Skipping symlink escaping HERMES_HOME: %s", rel)
+            continue
         if not src.is_file():
             continue
 
-        dst = snap_dir / rel
+        dst = _safe_dst_under(snap_dir, rel)
+        if dst is None:
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -555,7 +666,10 @@ def create_quick_snapshot(
                 if not _safe_copy_db(src, dst):
                     continue
             else:
-                shutil.copy2(src, dst)
+                shutil.copy2(src, dst, follow_symlinks=True)
+            if not _is_within(snap_dir, dst):
+                dst.unlink(missing_ok=True)
+                continue
             manifest[rel] = dst.stat().st_size
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
@@ -568,7 +682,7 @@ def create_quick_snapshot(
     meta = {
         "id": snap_id,
         "timestamp": ts,
-        "label": label,
+        "label": safe_label,
         "file_count": len(manifest),
         "total_size": sum(manifest.values()),
         "files": manifest,
@@ -596,13 +710,18 @@ def list_quick_snapshots(
     for d in sorted(root.iterdir(), reverse=True):
         if not d.is_dir():
             continue
+        # Ignore traversal-looking directory names that should never restore.
+        try:
+            _validate_snapshot_id(d.name)
+        except ValueError:
+            continue
         manifest_path = d / "manifest.json"
         if manifest_path.exists():
             try:
                 with open(manifest_path, encoding="utf-8") as f:
                     results.append(json.load(f))
             except (json.JSONDecodeError, OSError):
-                results.append({"id": d.name, "file_count": 0, "total_size": 0})
+                results.append({"id": d.name, "file_count": 0, "total_size": 0, "corrupt": True})
         if len(results) >= limit:
             break
 
@@ -617,28 +736,58 @@ def restore_quick_snapshot(
 
     Overwrites current state files with the snapshot's copies.
     Returns True if at least one file was restored.
-    """
-    home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-    snap_dir = root / snapshot_id
 
-    if not snap_dir.is_dir():
+    Fail-closed on missing snapshot, corrupt/unusable manifest, path traversal
+    in the snapshot id or file entries, or symlink destinations escaping home.
+    """
+    home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
+    home = home.resolve()
+    root = _quick_snapshot_root(home)
+
+    try:
+        sid = _validate_snapshot_id(snapshot_id)
+    except ValueError as exc:
+        logger.error("Refusing unsafe snapshot id: %s", exc)
+        return False
+
+    snap_dir = root / sid
+    if not snap_dir.is_dir() or not _is_within(root, snap_dir):
         return False
 
     manifest_path = snap_dir / "manifest.json"
-    if not manifest_path.exists():
+    if not manifest_path.is_file():
         return False
 
-    with open(manifest_path, encoding="utf-8") as f:
-        meta = json.load(f)
+    try:
+        with open(manifest_path, encoding="utf-8") as f:
+            meta = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        logger.error("Corrupt snapshot manifest %s: %s", sid, exc)
+        return False
+
+    if not isinstance(meta, dict):
+        logger.error("Corrupt snapshot manifest %s: not an object", sid)
+        return False
+
+    files = meta.get("files")
+    if not isinstance(files, dict) or not files:
+        logger.error("Corrupt snapshot manifest %s: missing files map", sid)
+        return False
 
     restored = 0
-    for rel in meta.get("files", {}):
-        src = snap_dir / rel
-        if not src.exists():
+    for rel in files:
+        dst = _safe_dst_under(home, str(rel))
+        src = _safe_dst_under(snap_dir, str(rel))
+        if dst is None or src is None:
+            logger.error("Refusing restore path traversal in snapshot %s: %s", sid, rel)
+            return False
+        if not src.is_file():
             continue
+        # Symlink sources must still resolve inside the snapshot dir.
+        if src.is_symlink() and not _is_within(snap_dir, src):
+            logger.error("Refusing symlink escape in snapshot %s: %s", sid, rel)
+            return False
 
-        dst = home / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -646,15 +795,25 @@ def restore_quick_snapshot(
                 # Atomic-ish replace for databases
                 tmp = dst.parent / f".{dst.name}.snap_restore"
                 shutil.copy2(src, tmp)
+                if not _is_within(home, tmp):
+                    tmp.unlink(missing_ok=True)
+                    return False
                 dst.unlink(missing_ok=True)
                 shutil.move(str(tmp), str(dst))
             else:
+                # If destination is a symlink escaping home, refuse.
+                if dst.exists() and dst.is_symlink() and not _is_within(home, dst):
+                    logger.error("Refusing to overwrite escaping symlink: %s", rel)
+                    return False
                 shutil.copy2(src, dst)
+            if not _is_within(home, dst):
+                logger.error("Restore wrote outside HERMES_HOME for %s", rel)
+                return False
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
 
-    logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
+    logger.info("Restored %d files from snapshot %s", restored, sid)
     return restored > 0
 
 

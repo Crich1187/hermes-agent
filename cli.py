@@ -5069,7 +5069,11 @@ class HermesCLI:
 
         elif subcmd == "create":
             label = " ".join(parts[2:]) if len(parts) > 2 else None
-            snap_id = create_quick_snapshot(label=label)
+            try:
+                snap_id = create_quick_snapshot(label=label)
+            except ValueError as exc:
+                print(f"  Invalid snapshot label: {exc}")
+                return
             if snap_id:
                 print(f"  Snapshot created: {snap_id}")
             else:
