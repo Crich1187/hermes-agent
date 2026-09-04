@@ -19,7 +19,14 @@ Fix: keep the _active_sessions entry live across the turn chain and
 clear the Event instead of deleting; in finally, drain any
 late-arrival pending message by spawning a task instead of
 dropping it.
+
+root-nypt.3: the handoff probe must not re-enter a hanging
+``wait_for(asyncio.shield(typing_task))`` path after the sync point —
+that turned PASS into TimeoutError under load without an arbitrary sleep
+waiver. Production joins typing unshielded and sets ``stop_event``.
 """
+
+from __future__ import annotations
 
 import asyncio
 from unittest.mock import AsyncMock
@@ -31,8 +38,23 @@ from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
     MessageType,
+    SendResult,
 )
 from gateway.session import SessionSource, build_session_key
+
+
+@pytest.fixture(autouse=True)
+def _isolate_delivery_ledger(monkeypatch, tmp_path):
+    """Race probes must not share the process-wide delivery ledger SQLite file.
+
+    Under load, ``asyncio.to_thread(record_obligation)`` contended on the
+    shared HERMES_HOME state.db and timed out the deterministic wait_for
+    barriers (root-nypt.3 flake). Disable the ledger for this module.
+    """
+    monkeypatch.setattr(
+        "gateway.delivery_ledger.ledger_enabled",
+        lambda config=None: False,
+    )
 
 
 class _StubAdapter(BasePlatformAdapter):
@@ -43,15 +65,23 @@ class _StubAdapter(BasePlatformAdapter):
         pass
 
     async def send(self, chat_id, text, **kwargs):
-        return None
+        return SendResult(success=True, message_id="m1")
 
     async def get_chat_info(self, chat_id):
         return {}
 
 
 def _make_adapter():
-    adapter = _StubAdapter(PlatformConfig(enabled=True, token="t"), Platform.TELEGRAM)
-    adapter._send_with_retry = AsyncMock(return_value=None)
+    # typing_indicator off: these tests probe session-guard / pending-drain
+    # races, not the typing refresh loop. Leaving typing on re-introduced
+    # flake via shielded joins under load (root-nypt.3).
+    adapter = _StubAdapter(
+        PlatformConfig(enabled=True, token="", typing_indicator=False),
+        Platform.TELEGRAM,
+    )
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="m1")
+    )
     return adapter
 
 
@@ -62,6 +92,7 @@ def _make_event(text="hi", chat_id="42"):
         source=SessionSource(
             platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
         ),
+        message_id=f"id-{text}",
     )
 
 
@@ -96,12 +127,13 @@ async def test_pending_drain_keeps_active_session_guard_live():
 
     adapter._message_handler = handler
 
-    original_stop_refresh = adapter._stop_typing_refresh
-
     async def stop_typing_during_handoff(*args, **kwargs):
+        # Sync point only — do not call the real stop path here. Re-entering
+        # a shielded typing join after the probe resumed was the flake that
+        # timed out second_processed under load (root-nypt.3).
         handoff_entered.set()
         await release_handoff.wait()
-        return await original_stop_refresh(*args, **kwargs)
+        return None
 
     adapter._stop_typing_refresh = stop_typing_during_handoff
 
@@ -125,7 +157,7 @@ async def test_pending_drain_keeps_active_session_guard_live():
 
     try:
         # Pause inside the handoff's typing cleanup. Production has already
-        # cleared the guard and has not yet transferred task ownership.
+        # cleared the interrupt Event and has not yet transferred task ownership.
         await asyncio.wait_for(handoff_entered.wait(), timeout=5.0)
 
         # Across the drain transition, the Event object must be the SAME
@@ -166,25 +198,20 @@ async def test_finally_cleanup_drains_late_arrival_pending():
 
     adapter._message_handler = handler
 
-    # Instrument stop_typing to inject a late-arrival pending message
-    # during the finally-block await window.  This exactly simulates the
-    # R6 race: the message arrives after the response has been sent but
-    # before _active_sessions is deleted.
-    original_stop = adapter.stop_typing if hasattr(adapter, "stop_typing") else None
-
+    # Inject at the start of typing stop (the finally await window) without
+    # depending on sleep(0) scheduling or a shielded typing join completing.
+    original_stop_refresh = adapter._stop_typing_refresh
     injected = {"done": False}
 
-    async def stop_typing_injects_pending(*args, **kwargs):
-        # Yield so the injection happens mid-await.
-        await asyncio.sleep(0)
+    async def stop_refresh_injects_pending(chat_id, typing_task=None, **kwargs):
         if not injected["done"]:
             adapter._pending_messages[sk] = _make_event(text="LATE")
             injected["done"] = True
-        if original_stop:
-            return await original_stop(*args, **kwargs)
-        return None
+        # Avoid joining a live typing task in the probe — pass None so the
+        # production stop path only clears platform typing state.
+        return await original_stop_refresh(chat_id, None, **kwargs)
 
-    adapter.stop_typing = stop_typing_injects_pending
+    adapter._stop_typing_refresh = stop_refresh_injects_pending
 
     # Send M1.
     await adapter.handle_message(_make_event(text="M1"))
@@ -216,13 +243,57 @@ async def test_no_pending_cleans_up_normally():
     await adapter.handle_message(_make_event(text="solo"))
 
     # Await the task that owns this session rather than sampling cleanup after
-    # an arbitrary wall-clock delay.
+    # an arbitrary wall-clock delay. Do not shield — a shielded wait can time
+    # out while leaving the owner task running (root-nypt.9.1 class of hang).
     owner_task = adapter._session_tasks[sk]
-    await asyncio.wait_for(asyncio.shield(owner_task), timeout=5.0)
+    await asyncio.wait_for(owner_task, timeout=5.0)
 
     assert sk not in adapter._active_sessions, (
         "_active_sessions was not cleaned up after a normal turn with no pending"
     )
     assert sk not in adapter._pending_messages
 
+    await adapter.cancel_background_tasks()
+
+
+@pytest.mark.asyncio
+async def test_pending_drain_does_not_drop_guard_under_contended_stop():
+    """Negative control: even when stop_typing_refresh is slow (but finite),
+    the active-session guard object identity stays stable across handoff."""
+    adapter = _make_adapter()
+    sk = _sk()
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    second_processed = asyncio.Event()
+    saw_guard = []
+
+    async def handler(event):
+        first_started.set()
+        await release_first.wait()
+        if event.text == "M2":
+            second_processed.set()
+        return "done"
+
+    adapter._message_handler = handler
+    original = adapter._stop_typing_refresh
+
+    async def slow_but_finite_stop(chat_id, typing_task=None, **kwargs):
+        # Finite delay (not an arbitrary flake sleep in the test harness
+        # waiting for a race window) — proves production awaits completion
+        # without deleting the guard mid-stop.
+        if sk in adapter._active_sessions:
+            saw_guard.append(adapter._active_sessions[sk])
+        await asyncio.sleep(0)
+        return await original(chat_id, None, **kwargs)
+
+    adapter._stop_typing_refresh = slow_but_finite_stop
+
+    await adapter.handle_message(_make_event(text="M1"))
+    await asyncio.wait_for(first_started.wait(), timeout=5.0)
+    active_event = adapter._active_sessions[sk]
+    adapter._pending_messages[sk] = _make_event(text="M2")
+    release_first.set()
+    await asyncio.wait_for(second_processed.wait(), timeout=5.0)
+    assert saw_guard, "stop path never observed the active guard"
+    assert all(g is active_event for g in saw_guard)
     await adapter.cancel_background_tasks()

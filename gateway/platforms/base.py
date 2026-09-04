@@ -5594,14 +5594,24 @@ class BasePlatformAdapter(ABC):
         metadata=None,
         timeout: float = 0.5,
         stop_attempts: int = 2,
+        stop_event: asyncio.Event | None = None,
     ) -> None:
-        """Stop the refresh task and platform typing state as one operation."""
+        """Stop the refresh task and platform typing state as one operation.
+
+        ``stop_event`` (when provided) is set before cancel so cooperative
+        waiters wake without relying solely on task cancellation. Do **not**
+        ``asyncio.shield`` the typing task: a shielded ``wait_for`` can time
+        out while leaving the task running, which stalls pending-drain handoff
+        and pytest-asyncio ``Runner.close`` (root-nypt.3 / root-nypt.9.1).
+        """
         self._typing_paused.add(chat_id)
         try:
+            if stop_event is not None and not stop_event.is_set():
+                stop_event.set()
             if typing_task is not None and not typing_task.done():
                 typing_task.cancel()
                 try:
-                    await asyncio.wait_for(asyncio.shield(typing_task), timeout=timeout)
+                    await asyncio.wait_for(typing_task, timeout=timeout)
                 except (asyncio.CancelledError, asyncio.TimeoutError):
                     # The task is cancelled; don't let a slow adapter-specific
                     # cleanup block response delivery or shutdown.
@@ -6663,10 +6673,13 @@ class BasePlatformAdapter(ABC):
             )
 
         async def _stop_typing_task() -> None:
+            # Wake cooperative stop_event waiters before cancel so typing
+            # cannot stall the pending-drain handoff or Runner.close.
             await self._stop_typing_refresh(
                 event.source.chat_id,
                 typing_task,
                 metadata=_thread_metadata,
+                stop_event=interrupt_event,
             )
         
         try:
