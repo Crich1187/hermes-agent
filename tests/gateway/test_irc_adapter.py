@@ -722,3 +722,106 @@ class TestIRCStandaloneSend:
         assert join_idx is not None, "JOIN must be sent for channel targets"
         assert privmsg_idx is not None
         assert join_idx < privmsg_idx, "JOIN must precede PRIVMSG"
+
+
+# ── Identity lock (root-37zuc) ─────────────────────────────────────────────
+
+
+class _StrictLockResult(tuple):
+    """A (bool, dict|None) result that refuses to be truth-tested.
+
+    acquire_scoped_lock returns a 2-tuple. Code that writes
+    ``if not acquire_scoped_lock(...)`` truth-tests the tuple — always truthy —
+    instead of unpacking it, which silently disables the guard. Returning this
+    from the fake turns that mistake into a hard failure: any ``bool()`` on the
+    result raises. A plain tuple cannot catch it, and a bare-bool fake actively
+    hides it.
+    """
+
+    def __bool__(self):  # pragma: no cover - raising IS the assertion
+        raise AssertionError(
+            "acquire_scoped_lock() result was truth-tested instead of unpacked"
+        )
+
+
+class TestIRCIdentityLock:
+    """The lock guard must fire, and must be reached by unpacking (root-37zuc)."""
+
+    def _adapter(self, monkeypatch):
+        from gateway.config import PlatformConfig
+
+        monkeypatch.setenv("IRC_SERVER", "irc.test.net")
+        monkeypatch.setenv("IRC_CHANNEL", "#test")
+        monkeypatch.setenv("IRC_NICKNAME", "hermesbot")
+        monkeypatch.setenv("IRC_USE_TLS", "false")
+        return IRCAdapter(PlatformConfig(enabled=True))
+
+    @pytest.mark.asyncio
+    async def test_connect_fails_when_identity_held_by_another_profile(self, monkeypatch):
+        """Fake returns REAL tuple shape (False, existing); connect must fail
+        and must not retain the lock key. StrictLockResult traps truth-tests.
+        """
+        import gateway.status as gateway_status
+
+        existing = {"pid": 4242}
+        network_hits = []
+
+        def _fake(scope, key, metadata=None):
+            assert scope == "irc"
+            assert key == "irc.test.net:hermesbot"
+            return _StrictLockResult((False, existing))
+
+        async def _boom(*_a, **_k):
+            network_hits.append(1)
+            raise AssertionError("open_connection must not run on lock conflict")
+
+        monkeypatch.setattr(gateway_status, "acquire_scoped_lock", _fake)
+        monkeypatch.setattr(_irc_mod.asyncio, "open_connection", _boom)
+        adapter = self._adapter(monkeypatch)
+        assert await adapter.connect() is False
+        assert getattr(adapter, "_lock_key", None) is None
+        assert adapter._fatal_error_code == "lock_conflict"
+        assert network_hits == []
+
+    @pytest.mark.asyncio
+    async def test_plain_tuple_conflict_does_not_retain_lock(self, monkeypatch):
+        """Same conflict path with a plain tuple (no __bool__ trap) — AC shape."""
+        import gateway.status as gateway_status
+
+        network_hits = []
+
+        async def _boom(*_a, **_k):
+            network_hits.append(1)
+            raise AssertionError("open_connection must not run on lock conflict")
+
+        monkeypatch.setattr(
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda scope, key, metadata=None: (False, {"pid": 4242}),
+        )
+        monkeypatch.setattr(_irc_mod.asyncio, "open_connection", _boom)
+        adapter = self._adapter(monkeypatch)
+        assert await adapter.connect() is False
+        assert getattr(adapter, "_lock_key", None) is None
+        assert adapter._fatal_error_code == "lock_conflict"
+        assert network_hits == []
+
+    @pytest.mark.asyncio
+    async def test_granted_lock_is_unpacked_not_truth_tested(self, monkeypatch):
+        """Guards against a fix that 'works' only because a tuple is truthy."""
+        import gateway.status as gateway_status
+
+        monkeypatch.setattr(
+            gateway_status,
+            "acquire_scoped_lock",
+            lambda scope, key, metadata=None: _StrictLockResult((True, None)),
+        )
+        # Fail fast after lock granted — we only need the unlock path reached.
+        async def _fail_open(*_a, **_k):
+            raise OSError("forced connect failure after lock grant")
+
+        monkeypatch.setattr(_irc_mod.asyncio, "open_connection", _fail_open)
+        adapter = self._adapter(monkeypatch)
+        assert await adapter.connect() is False
+        assert adapter._lock_key == "irc.test.net:hermesbot"
+        assert adapter._fatal_error_code == "connect_failed"
