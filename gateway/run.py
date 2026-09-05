@@ -6193,7 +6193,10 @@ class GatewayRunner:
                             message_id=event.message_id,
                             channel_prompt=event.channel_prompt,
                         )
-                        adapter._pending_messages[_quick_key] = queued_event
+                        # FIFO, not assignment: a raw assignment silently
+                        # overwrote an already-queued turn (root-eh4), so
+                        # "/queue A" then "/steer B" during startup lost A.
+                        self._enqueue_fifo(_quick_key, queued_event, adapter)
                     return "Agent still starting — /steer queued for the next turn."
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
@@ -6215,7 +6218,9 @@ class GatewayRunner:
                         message_id=event.message_id,
                         channel_prompt=event.channel_prompt,
                     )
-                    adapter._pending_messages[_quick_key] = queued_event
+                    # FIFO, not assignment — same reason as the sentinel
+                    # fallback above (root-eh4).
+                    self._enqueue_fifo(_quick_key, queued_event, adapter)
                 return "No active agent — /steer queued for the next turn."
 
             # /model must not be used while the agent is running.
