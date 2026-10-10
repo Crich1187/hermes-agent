@@ -24,7 +24,7 @@ from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
 
-from hermes_constants import get_hermes_home, mkdir_under_hermes_home
+from hermes_constants import get_hermes_home, mkdir_under_hermes_home, shared_profile_file_mode
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, TypeVar, cast
 
 from hermes_state_common import (
@@ -223,8 +223,16 @@ def _ensure_test_isolation(db_path: Path) -> None:
             )
 
 
+def _shared_state_db_mode(db_path: Path) -> int | None:
+    mode = shared_profile_file_mode(db_path, home=db_path.parent)
+    if mode is not None:
+        for suffix in ("-wal", "-shm"):
+            shared_profile_file_mode(db_path.with_name(db_path.name + suffix), home=db_path.parent)
+    return mode
+
+
 def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
-    """Create/tighten a writable state database and its sidecars to 0600.
+    """Create/tighten a writable state database and its sidecars to the validated mode.
 
     SQLite otherwise creates ``state.db``, ``-wal``, and ``-shm`` according to
     the process umask (commonly 0644 under 0022). Read-only SessionDB
@@ -241,6 +249,8 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
     if os.name == "nt":
         return
 
+    shared_mode = _shared_state_db_mode(db_path)
+    mode = shared_mode or 0o600
     main_path = db_path
     if create_main:
         # O_EXCL: only a brand-new inode gets a descriptor. Opening an existing
@@ -251,7 +261,7 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
         try:
-            fd = os.open(main_path, flags, 0o600)
+            fd = os.open(main_path, flags, mode)
         except FileExistsError:
             pass
         except IsADirectoryError:
@@ -279,7 +289,11 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
             continue
         if not stat.S_ISREG(st.st_mode):
             continue
-        os.chmod(path, 0o600)
+        if shared_mode is not None:
+            shared_profile_file_mode(path, home=db_path.parent)
+            if stat.S_IMODE(st.st_mode) == mode:
+                continue
+        os.chmod(path, mode)
 
 
 # Openings of the background-review harness prompts (agent/background_review.py).
@@ -636,6 +650,7 @@ class SessionDB(
         malformed sqlite_master), generation stamp."""
         # Never materialize a deleted/archived named profile's home: a multiplexer or Desktop backend
         # still holding the profile's route would otherwise re-scaffold it on the next turn (#94590).
+        _shared_state_db_mode(self.db_path)
         mkdir_under_hermes_home(self.db_path.parent)
         # Read-only file/sidecar preflight BEFORE the first connection: an actionable message
         # instead of an opaque "attempt to write a readonly database" from inside _init_schema.
@@ -682,6 +697,7 @@ class SessionDB(
         must exist. FTS flags are probed with SELECTs only, and the connection is
         closed on ANY probe failure (malformed schema raises DatabaseError) so a
         leaked tracked connection cannot block the forensic backup the writable heal takes next."""
+        _shared_state_db_mode(self.db_path)
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
                 self._conn = conn = self._connect_read_only(timeout=1.0)

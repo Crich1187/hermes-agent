@@ -415,7 +415,8 @@ class IndentDumper(yaml.SafeDumper):
 
 
 def atomic_yaml_write(path: Union[str, Path], data: Any, *, default_flow_style: bool = False, sort_keys: bool = False,
-                      extra_content: str | None = None, create_mode: "int | None" = None) -> None:
+                      extra_content: str | None = None, create_mode: "int | None" = None,
+                      mode: "int | None" = None) -> None:
     """Write YAML to *path* atomically (temp file + fsync + replace)."""
     path = Path(path)
 
@@ -427,7 +428,8 @@ def atomic_yaml_write(path: Union[str, Path], data: Any, *, default_flow_style: 
         if extra_content:
             f.write(extra_content)
 
-    _atomic_write(path, _write, prefix=f".{path.stem}_", mode=_mode_for_write(path, create_mode))
+    _atomic_write(path, _write, prefix=f".{path.stem}_",
+                  mode=mode if mode is not None else _mode_for_write(path, create_mode))
 
 
 def _roundtrip_load(path: Path):

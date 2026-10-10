@@ -865,13 +865,13 @@ def profile_cli_selector() -> str:
     return f"-p {name} " if name and name != "default" else ""
 
 
-def shared_profile_file_mode(path: Path) -> int | None:
+def shared_profile_file_mode(path: Path, *, home: Path | None = None) -> int | None:
     """Honor explicitly provisioned profile sharing without widening private homes."""
     if (os.name != "posix" or os.environ.get("HERMES_SKIP_CHMOD", "").lower() not in {"1", "true", "yes", "on"}
             or os.environ.get("HERMES_HOME_MODE", "").strip() != "2770"):
         return None
     parent = path.parent.absolute()
-    if (parent != get_hermes_home().absolute() or len(parent.parts) < 3
+    if (parent != (home if home is not None else get_hermes_home()).absolute() or len(parent.parts) < 3
             or parent == _INSTALL_ROOT or _INSTALL_ROOT in parent.parents):
         return None
     import grp

@@ -831,6 +831,8 @@ def write_profile_meta(
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     path = profile_dir / "profile.yaml"
+    from hermes_constants import shared_profile_file_mode
+    mode = shared_profile_file_mode(path, home=profile_dir)
     existing: dict = _load_yaml_dict(path) or {}
     if description is not None:
         existing["description"] = description.strip()
@@ -854,7 +856,7 @@ def write_profile_meta(
     # parse errors as {}, so a crashed write would silently drop unspecified fields.
     # See #51356.
     from utils import atomic_yaml_write
-    atomic_yaml_write(path, existing, sort_keys=False)
+    atomic_yaml_write(path, existing, sort_keys=False, mode=mode)
 
 
 def format_profile_label(name: str, display_name: Optional[str]) -> str:

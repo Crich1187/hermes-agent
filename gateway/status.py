@@ -12,6 +12,7 @@ import os
 import re
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import threading
@@ -21,7 +22,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, NamedTuple, Optional
 
-from hermes_constants import _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home
+from hermes_constants import (
+    _get_platform_default_hermes_home, get_hermes_home, get_process_hermes_home, shared_profile_file_mode,
+)
 from utils import atomic_json_write
 
 if sys.platform == "win32":
@@ -741,7 +744,8 @@ def _read_json_file(path: Path, *, bare_pid_ok: bool = False) -> Optional[dict[s
 
 
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
-    atomic_json_write(path, payload, indent=None, separators=(",", ":"))
+    mode = shared_profile_file_mode(path, home=path.parent) if path.name == _RUNTIME_STATUS_FILE else None
+    atomic_json_write(path, payload, indent=None, separators=(",", ":"), mode=mode)
 
 
 def _unlink_quietly(path: Path) -> None:
@@ -920,16 +924,38 @@ def _release_file_lock(handle) -> None:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
+def _open_shared_runtime_lock(path: Path, mode: int):
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), mode)
+    try:
+        info = os.fstat(fd)
+        shared_profile_file_mode(path)
+        target = path.lstat()
+        if (info.st_dev, info.st_ino) != (target.st_dev, target.st_ino):
+            raise PermissionError("Shared gateway lock changed while opening")
+        if stat.S_IMODE(info.st_mode) != mode:
+            os.fchmod(fd, mode)
+        return os.fdopen(fd, "a+", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def acquire_gateway_runtime_lock() -> bool:
     """Claim the cross-process runtime lock; the OS releases it if the process dies."""
     global _gateway_lock_handle
     if _gateway_lock_handle is not None:
         return True
     path = _get_gateway_lock_path()
+    try:
+        shared_mode = shared_profile_file_mode(path)
+    except (OSError, KeyError):
+        return False
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        handle = open(path, "a+", encoding="utf-8")
+        handle = _open_shared_runtime_lock(path, shared_mode) if shared_mode is not None else open(path, "a+", encoding="utf-8")
     except PermissionError:
+        if shared_mode is not None:
+            return False
         # Stale root-owned lock (launchd session that ran as root): the directory owner can
         # unlink it; retry once with a fresh file.
         try:
@@ -986,14 +1012,13 @@ def is_gateway_runtime_lock_active(lock_path: Optional[Path] = None) -> bool:
     resolved_lock_path = lock_path or _get_gateway_lock_path()
     if _gateway_lock_handle is not None and resolved_lock_path == _get_gateway_lock_path():
         return True
-    if not resolved_lock_path.exists():
-        return False
+    shared_profile_file_mode(resolved_lock_path, home=resolved_lock_path.parent)
     try:
-        handle = open(resolved_lock_path, "a+", encoding="utf-8")
-    except PermissionError:
-        # Stale root-owned lock (see acquire_gateway_runtime_lock): report inactive.
-        _unlink_quietly(resolved_lock_path)
+        handle = open(resolved_lock_path, "r+" if _IS_WINDOWS else "r", encoding="utf-8")
+    except FileNotFoundError:
         return False
+    except PermissionError:
+        raise RuntimeError("gateway runtime lock is not inspectable") from None
     return _probe_lock_file(handle)
 
 
@@ -1010,8 +1035,9 @@ def _strict_path_exists(path: Path, label: str) -> bool:
 
 def _is_gateway_runtime_lock_active_strict(lock_path: Path) -> bool:
     """Probe ownership without treating access failures as absence."""
+    shared_profile_file_mode(lock_path, home=lock_path.parent)
     try:
-        handle = open(lock_path, "r+", encoding="utf-8")
+        handle = open(lock_path, "r+" if _IS_WINDOWS else "r", encoding="utf-8")
     except FileNotFoundError:
         return False
     except OSError as exc:

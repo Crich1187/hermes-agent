@@ -40,7 +40,13 @@ def open_db(
     from hermes_state_wal import apply_wal_with_fallback
 
     path = Path(path)
+    shared_projects = False
+    if path.name == "projects.db":
+        from hermes_state import _shared_state_db_mode, _secure_state_db_files
+        shared_projects = _shared_state_db_mode(path) is not None
     path.parent.mkdir(parents=True, exist_ok=True)
+    if shared_projects:
+        _secure_state_db_files(path, create_main=True)
     # Resolved at call time: fd-leak tests patch ``sqlite3.connect`` through the caller's module.
     conn = sqlite3.connect(path, timeout=busy_timeout_ms / 1000, check_same_thread=check_same_thread)
     try:
@@ -61,6 +67,8 @@ def open_db(
             conn.execute("PRAGMA synchronous=FULL")
         if initialize is not None:
             initialize(conn)
+        if shared_projects:
+            _secure_state_db_files(path)
     except BaseException:
         conn.close()
         raise
