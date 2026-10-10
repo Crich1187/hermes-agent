@@ -625,6 +625,58 @@ class TestReasoningOverridesDefaultConfig:
 class TestSecureParentDir:
     """Tests for secure_parent_dir() — prevents chmod on / or top-level dirs."""
 
+    @pytest.mark.linux_only
+    def test_explicit_shared_parent_requires_group_membership_and_runtime_scope(self, tmp_path, monkeypatch):
+        parent = tmp_path / "profile"
+        parent.mkdir()
+        parent.chmod(0o2770)
+        target = parent / "auth.json"
+        monkeypatch.setenv("HERMES_HOME", str(parent))
+        monkeypatch.setenv("HERMES_SKIP_CHMOD", "1")
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+        secure_parent_dir(target)
+        assert parent.stat().st_mode & 0o7777 == 0o2770
+        monkeypatch.setattr(os, "geteuid", lambda: 123456)
+        monkeypatch.setattr(os, "getegid", lambda: parent.stat().st_gid + 1)
+        monkeypatch.setattr(os, "getgroups", lambda: [])
+        with pytest.raises(PermissionError):
+            secure_parent_dir(target)
+        monkeypatch.undo()
+        monkeypatch.setenv("HERMES_HOME", str(parent))
+        monkeypatch.setenv("HERMES_SKIP_CHMOD", "1")
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+        import grp
+        import pwd
+        target.touch(mode=0o660)
+        original_lstat = Path.lstat
+        real_info = target.lstat()
+        dashboard_uid = 123456
+        dashboard_info = SimpleNamespace(st_uid=dashboard_uid, st_gid=real_info.st_gid,
+                                         st_mode=real_info.st_mode, st_nlink=1)
+        monkeypatch.setattr(Path, "lstat", lambda path: dashboard_info if path == target else original_lstat(path))
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_name="dashboard", pw_gid=real_info.st_gid + 1))
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(gr_mem=["dashboard"]))
+        assert hermes_constants.shared_profile_file_mode(target) == 0o660
+        monkeypatch.setattr(grp, "getgrgid", lambda gid: SimpleNamespace(gr_mem=[]))
+        with pytest.raises(PermissionError):
+            hermes_constants.shared_profile_file_mode(target)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "another"))
+        assert hermes_constants.shared_profile_file_mode(target) is None
+
+    @pytest.mark.linux_only
+    def test_explicit_shared_parent_symlink_is_rejected(self, tmp_path, monkeypatch):
+        parent = tmp_path / "profile"
+        parent.mkdir()
+        parent.chmod(0o2770)
+        link = tmp_path / "linked-profile"
+        link.symlink_to(parent)
+        monkeypatch.setenv("HERMES_HOME", str(link))
+        monkeypatch.setenv("HERMES_SKIP_CHMOD", "1")
+        monkeypatch.setenv("HERMES_HOME_MODE", "2770")
+        with pytest.raises(PermissionError):
+            secure_parent_dir(link / "auth.json")
+        assert parent.stat().st_mode & 0o7777 == 0o2770
+
     def test_safe_path_calls_chmod(self, tmp_path, monkeypatch):
         """Normal nested path (depth >= 3) should call os.chmod."""
         safe_dir = tmp_path / "home" / "user" / ".hermes"

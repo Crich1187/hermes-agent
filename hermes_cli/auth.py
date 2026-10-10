@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, FrozenSet, Iterable, List, Optional, Tuple
 from urllib.parse import urlparse
 
-from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir
+from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key, secure_parent_dir, shared_profile_file_mode
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_json_write, atomic_yaml_write, env_float, file_signature, is_truthy_value  # noqa: F401  (env_float: agent.credential_pool reads auth_mod.env_float)
 from hermes_cli.auth_zai_kimi import (  # noqa: F401  re-exported
@@ -616,7 +616,21 @@ def _file_lock(
                     lock_path.write_text(" ", encoding="utf-8")
                 except (OSError, PermissionError):
                     pass
-            lock_file = stack.enter_context(lock_path.open("r+" if msvcrt else "a+", encoding="utf-8"))
+            shared_mode = shared_profile_file_mode(lock_path)
+            if shared_mode is not None:
+                fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, shared_mode)
+                try:
+                    info = os.fstat(fd)
+                    if info.st_gid != lock_path.parent.stat().st_gid or info.st_nlink != 1:
+                        raise PermissionError("Shared profile lock group is not authorized")
+                    if info.st_mode & 0o7777 != shared_mode:
+                        os.fchmod(fd, shared_mode)
+                    lock_file = stack.enter_context(os.fdopen(fd, "a+", encoding="utf-8"))
+                except BaseException:
+                    os.close(fd)
+                    raise
+            else:
+                lock_file = stack.enter_context(lock_path.open("r+" if msvcrt else "a+", encoding="utf-8"))
             deadline = time.monotonic() + max(1.0, timeout_seconds)
             while True:
                 try:
@@ -707,12 +721,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
 
 
 def _save_private_json(target: Path, data: Any, *, fsync_dir: bool = False, **dump_kwargs: Any) -> None:
-    """0600 credential JSON under a 0700 parent (``secure_parent_dir`` refuses ``/``, top-level dirs
-    and the install tree). ``atomic_json_write`` creates the temp file 0600 before any byte lands."""
+    """Write private JSON, honoring a protected, explicitly shared runtime profile."""
     from hermes_constants import mkdir_under_hermes_home
     mkdir_under_hermes_home(target.parent)
     secure_parent_dir(target)
-    atomic_json_write(target, data, mode=0o600, fsync_dir=fsync_dir, **dump_kwargs)
+    mode = shared_profile_file_mode(target)
+    atomic_json_write(target, data, mode=mode if mode is not None else 0o600, fsync_dir=fsync_dir, **dump_kwargs)
 
 
 def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:

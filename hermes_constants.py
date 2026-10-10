@@ -865,8 +865,49 @@ def profile_cli_selector() -> str:
     return f"-p {name} " if name and name != "default" else ""
 
 
+def shared_profile_file_mode(path: Path) -> int | None:
+    """Honor explicitly provisioned profile sharing without widening private homes."""
+    if (os.name != "posix" or os.environ.get("HERMES_SKIP_CHMOD", "").lower() not in {"1", "true", "yes", "on"}
+            or os.environ.get("HERMES_HOME_MODE", "").strip() != "2770"):
+        return None
+    parent = path.parent.absolute()
+    if (parent != get_hermes_home().absolute() or len(parent.parts) < 3
+            or parent == _INSTALL_ROOT or _INSTALL_ROOT in parent.parents):
+        return None
+    import grp
+    import pwd
+
+    if any(part.is_symlink() for part in (parent, *parent.parents)):
+        raise PermissionError("Shared profile parent must not be a symlink")
+    info = parent.lstat()
+    groups = {os.getegid(), *os.getgroups()}
+    if (not stat.S_ISDIR(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o2770
+            or (os.geteuid() != 0 and info.st_gid not in groups)):
+        raise PermissionError("Shared profile parent is not protected or authorized")
+    members = grp.getgrgid(info.st_gid).gr_mem
+    entries = [info]
+    try:
+        target = path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        if (not stat.S_ISREG(target.st_mode) or target.st_nlink != 1 or target.st_gid != info.st_gid
+                or stat.S_IMODE(target.st_mode) & ~0o660):
+            raise PermissionError("Shared profile file is not protected")
+        entries.append(target)
+    for entry in entries:
+        if entry.st_uid in (0, os.geteuid()):
+            continue
+        owner = pwd.getpwuid(entry.st_uid)
+        if owner.pw_gid != info.st_gid and owner.pw_name not in members:
+            raise PermissionError("Shared profile owner is not authorized")
+    return 0o660
+
+
 def secure_parent_dir(path: Path) -> None:
     """Chmod ``0o700`` on *path*'s parent, refusing ``/`` and top-level dirs (misresolved HERMES_HOME)."""
+    if shared_profile_file_mode(path) is not None:
+        return
     parent = path.parent.resolve()
     if parent == Path("/") or len(parent.parts) < 3:
         return
